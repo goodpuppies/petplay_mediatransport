@@ -97,7 +97,10 @@ pub fn encode(addr: &EndpointAddr) -> Result<String> {
             }
             TransportAddr::Relay(url) => {
                 let text = url.to_string();
-                ensure!(text.len() <= MAX_RELAY_URL, "relay URL is too long to share");
+                ensure!(
+                    text.len() <= MAX_RELAY_URL,
+                    "relay URL is too long to share"
+                );
                 bytes.push(KIND_RELAY);
                 bytes.extend_from_slice(&(text.len() as u16).to_be_bytes());
                 bytes.extend_from_slice(text.as_bytes());
@@ -157,7 +160,10 @@ pub fn decode(code: &str) -> Result<EndpointAddr> {
         };
         rest = &body[used..];
         count += 1;
-        ensure!(count <= MAX_ADDRESSES, "too many addresses in the share code");
+        ensure!(
+            count <= MAX_ADDRESSES,
+            "too many addresses in the share code"
+        );
     }
     ensure!(count > 0, "the share code carries no address to connect to");
     Ok(addr)
@@ -176,18 +182,13 @@ pub fn direct_addresses(addr: &EndpointAddr) -> Vec<SocketAddr> {
 
 /// Fail unless the path to `peer` became a direct one.
 ///
-/// iroh starts a connection over the relay and upgrades it once holepunching succeeds,
-/// so the first frames of a stream can still traverse a relay before this returns.
+/// The gateway must not expose its consuming origin before this returns. Connection
+/// setup and announcements can use a relay, but track requests are deferred.
 pub async fn require_direct(endpoint: &Endpoint, peer: EndpointId, within: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
-        if let Some(info) = endpoint.remote_info(peer).await {
-            if info.addrs().any(|entry| {
-                matches!(entry.usage(), TransportAddrUsage::Active)
-                    && matches!(entry.addr(), TransportAddr::Ip(_))
-            }) {
-                return Ok(());
-            }
+        if is_direct(endpoint, peer).await {
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
@@ -196,6 +197,26 @@ pub async fn require_direct(endpoint: &Endpoint, peer: EndpointId, within: Durat
             );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn is_direct(endpoint: &Endpoint, peer: EndpointId) -> bool {
+    endpoint.remote_info(peer).await.is_some_and(|info| {
+        info.addrs().any(|entry| {
+            matches!(entry.usage(), TransportAddrUsage::Active)
+                && matches!(entry.addr(), TransportAddr::Ip(_))
+        })
+    })
+}
+
+/// Stop an established gateway when the direct route disappears instead of allowing
+/// an indefinite relay fallback. Observation is periodic, not a packet-level relay ban.
+pub async fn watch_direct(endpoint: &Endpoint, peer: EndpointId) -> Result<()> {
+    loop {
+        if !is_direct(endpoint, peer).await {
+            bail!("direct peer-to-peer path to {peer} was lost; refusing relay fallback");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -219,7 +240,10 @@ mod tests {
         let decoded = decode(&code).unwrap();
         assert_eq!(decoded, addr);
         // Pasted codes pick up whitespace and case changes on the way.
-        assert_eq!(decode(&format!("  {}\n", code.to_uppercase())).unwrap(), addr);
+        assert_eq!(
+            decode(&format!("  {}\n", code.to_uppercase())).unwrap(),
+            addr
+        );
         assert_eq!(direct_addresses(&decoded).len(), 2);
     }
 
@@ -245,6 +269,14 @@ mod tests {
                 .await
                 .expect_err("a peer with no path must be refused");
             assert!(error.to_string().contains("no direct peer-to-peer path"));
+            let error = watch_direct(&endpoint, absent)
+                .await
+                .expect_err("an established gateway must stop when no direct path remains");
+            assert!(
+                error
+                    .to_string()
+                    .contains("was lost; refusing relay fallback")
+            );
             endpoint.close().await;
         });
     }

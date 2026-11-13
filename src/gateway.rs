@@ -41,10 +41,8 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let _enter = runtime.enter();
     let _ = moq_tokio::crypto::install_default();
     let origin = moq_tokio::origin::spawn();
-    let (fingerprint, _) =
-        crate::publish::serve(&runtime, origin.consume(), bind, crate::publish::Transport::Browser)?;
-    crate::web::start(bind, &fingerprint)?;
-    runtime.block_on(async move {
+    let browser_origin = origin.consume();
+    runtime.block_on(async {
         let endpoint = match shared.clone() {
             Some(addr) => crate::peer::endpoint(Some(addr)).await?,
             None => crate::publish::local_endpoint().await?,
@@ -56,26 +54,30 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             .with_iroh(endpoint.clone())
             .with_iroh_addrs(direct)
             .with_subscriber(origin);
-        println!("GATEWAY_READY transport=iroh browser_fingerprint={fingerprint}");
         let session = client.connect(url);
-        match shared {
-            // Refuse to relay a stream through a third party: hold the session only as
-            // long as a direct path exists, and report the relayed case as a failure.
-            Some(addr) => {
-                let direct = crate::peer::require_direct(
-                    &endpoint,
-                    addr.id,
-                    std::time::Duration::from_secs(15),
-                );
-                tokio::select! {
-                    result = direct => {
-                        result?;
-                        println!("GATEWAY_DIRECT peer={}", addr.id);
-                        session.closed().await?;
-                    }
-                    result = session.closed() => result?,
+        // Do not expose a consuming origin to browsers until holepunching succeeds.
+        // MoQ requests tracks lazily: before this gate there are no downstream
+        // consumers and therefore no video/config subscriptions on the iroh session.
+        if let Some(addr) = &shared {
+            tokio::select! {
+                result = crate::peer::require_direct(&endpoint, addr.id, std::time::Duration::from_secs(15)) => result?,
+                result = session.closed() => {
+                    result?;
+                    anyhow::bail!("source closed before a direct media path was established");
                 }
             }
+            println!("GATEWAY_DIRECT peer={}", addr.id);
+        }
+        let (fingerprint, _) = crate::publish::serve(
+            &runtime, browser_origin, bind, crate::publish::Transport::Browser,
+        )?;
+        crate::web::start(bind, &fingerprint)?;
+        println!("GATEWAY_READY transport=iroh browser_fingerprint={fingerprint}");
+        match shared {
+            Some(addr) => tokio::select! {
+                result = crate::peer::watch_direct(&endpoint, addr.id) => result?,
+                result = session.closed() => result?,
+            },
             None => session.closed().await?,
         }
         Ok(())

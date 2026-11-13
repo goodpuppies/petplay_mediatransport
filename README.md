@@ -82,10 +82,16 @@ and nothing is published to a discovery service — so holding the code is the o
 find the source, and also all that is needed to watch it. Restricting a source to specific
 viewer identities is not implemented. The code also contains the source's IP addresses.
 
-Relays carry connection setup and holepunch coordination only. The viewer requires the
-media path to become direct and fails after 15 seconds otherwise, rather than sending the
-stream through a third party's relay. Because iroh starts on the relay and upgrades after
-holepunching, the first frames can still traverse one before `GATEWAY_DIRECT` is printed.
+The gateway waits for a direct path before starting its browser listener, failing after
+15 seconds if it cannot establish one. MoQ track requests are lazy, so no browser can request
+video/config frames during relay-assisted setup. `GATEWAY_DIRECT` is printed before
+`VIEWER_READY` and `GATEWAY_READY`.
+
+After startup the gateway observes the direct route every 100 ms and stops when iroh reports
+it lost. This is a fail-on-observed-loss policy, not a packet-level relay prohibition: iroh's
+path detection and a subsequent poll can lag a path transition. Brief fallback traffic during
+that detection window is still possible. Relays may carry encrypted connection setup and MoQ
+announcements before media is enabled.
 
 Each WebTransport listener also serves viewer HTML, JavaScript, and `config.json` over TCP on
 the same IP at its port plus one. For this example the gateway viewer is

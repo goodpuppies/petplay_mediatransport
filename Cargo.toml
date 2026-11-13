@@ -9,12 +9,17 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 libc = "0.2"
-moq-vaapi = "=0.2.1"
+moq-vaapi = { version = "=0.2.1", optional = true }
 bytes = "1"
 moq-net = "=0.3.10"
 moq-tokio = { version = "=0.19.23", default-features = false, features = ["noq", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal"] }
 url = "2"
+data-encoding = "2"
 
 [features]
+default = ["encode"]
+# The GPU encoder and its DMA-BUF ingestion need a VA-API device. A viewer-only build
+# (the `gateway` subcommand) drops them, which is what a non-Linux receiver needs.
+encode = ["moq-vaapi"]
 iroh = ["moq-tokio/iroh"]

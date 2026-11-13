@@ -12,7 +12,8 @@ This is an early Linux video prototype, not yet a cross-platform media framework
 
 - Import Vulkan DMA-BUF frames and synchronization FDs from a Unix seqpacket socket.
 - Convert RGB to NV12 and encode H.264 with VAAPI, without a CPU raw-frame fallback.
-- Publish timestamped encoded video over MoQ, optionally through a loopback-only Iroh endpoint.
+- Publish timestamped encoded video over MoQ, through a loopback-only or a peer-to-peer
+  Iroh endpoint announced as a share code.
 - Relay MoQ tracks from Iroh to browser WebTransport without decoding or re-encoding.
 - Receive and decode in a WebCodecs browser viewer, with timestamp-based presentation.
 - Optionally record encoded H.264 and a frame journal.
@@ -35,6 +36,13 @@ cargo test --release --features iroh
 cargo build --release --features iroh
 ```
 
+A viewer-only build drops the GPU encoder and its DMA-BUF ingestion, which is what a
+receiver on a platform without VA-API needs. It can only run the `gateway` subcommand:
+
+```sh
+cargo build --release --no-default-features --features iroh
+```
+
 The Cargo package is `petplay-mediatransport`; the executable remains `petplay-media`.
 Viewer assets must be built before starting the executable. They are loaded from this checkout's
 `web/` directory; the executable is not yet a standalone deployable bundle.
@@ -55,6 +63,29 @@ to loopback. Start a gateway with those printed values:
 ```sh
 target/release/petplay-media gateway iroh://SOURCE_ID/ SOURCE_ADDRESS 127.0.0.1:4470
 ```
+
+## Peer-to-peer over the internet
+
+`--iroh-share` replaces `--iroh-local` with an endpoint that can reach a peer across the
+internet, and prints one pasteable token:
+
+```sh
+target/release/petplay-media "$PWD/_scratch/media.sock" - 127.0.0.1:4450 --iroh-share \
+  --layout mono --fps 60
+# IROH_SHARE code=...
+target/release/petplay-media gateway CODE 127.0.0.1:4470
+# GATEWAY_DIRECT peer=...
+```
+
+**A share code is a secret.** It carries the endpoint id, relay URL and direct addresses,
+and nothing is published to a discovery service — so holding the code is the only way to
+find the source, and also all that is needed to watch it. Restricting a source to specific
+viewer identities is not implemented. The code also contains the source's IP addresses.
+
+Relays carry connection setup and holepunch coordination only. The viewer requires the
+media path to become direct and fails after 15 seconds otherwise, rather than sending the
+stream through a third party's relay. Because iroh starts on the relay and upgrades after
+holepunching, the first frames can still traverse one before `GATEWAY_DIRECT` is printed.
 
 Each WebTransport listener also serves viewer HTML, JavaScript, and `config.json` over TCP on
 the same IP at its port plus one. For this example the gateway viewer is
@@ -109,8 +140,9 @@ necessarily skips some source frames.
 
 ## Layout and next boundaries
 
-- `src/main.rs`: Linux DMA-BUF ingestion, synchronization, VAAPI encoding, recording, ACKs.
+- `src/source.rs`: Linux DMA-BUF ingestion, synchronization, VAAPI encoding, recording, ACKs.
 - `src/publish.rs`: custom MoQ tracks and native transport endpoints.
+- `src/peer.rs`: share codes, the peer endpoint, and the direct-path requirement.
 - `src/gateway.rs`: Iroh-to-WebTransport relay.
 - `src/web.rs`: viewer assets and certificate configuration.
 - `web/`: TypeScript WebCodecs receiver and presentation.

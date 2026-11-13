@@ -1,8 +1,13 @@
 //! Small MoQ broadcast: config JSON and timestamped Annex-B access units.
 use anyhow::{Context, Result};
-use moq_net::{Timescale, Timestamp, broadcast, group, origin, track};
-use std::{net::SocketAddr, time::Duration};
+use moq_net::origin;
+#[cfg(feature = "encode")]
+use moq_net::{Timescale, Timestamp, broadcast, group, track};
+use std::net::SocketAddr;
+#[cfg(feature = "encode")]
+use std::time::Duration;
 /// How one encoded picture carries the source's views.
+#[cfg(feature = "encode")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// One view filling the picture, such as a desktop or a single camera.
@@ -10,6 +15,7 @@ pub enum Layout {
     /// Two views of equal width, left then right.
     SideBySide,
 }
+#[cfg(feature = "encode")]
 impl Layout {
     pub fn parse(text: &str) -> Result<Self> {
         match text {
@@ -26,6 +32,7 @@ impl Layout {
     }
 }
 /// The source geometry a receiver needs before the first access unit.
+#[cfg(feature = "encode")]
 #[derive(Clone, Copy, Debug)]
 pub struct Format {
     pub width: u32,
@@ -33,6 +40,22 @@ pub struct Format {
     pub framerate: u32,
     pub layout: Layout,
 }
+/// Which transports a source accepts viewers on.
+//
+// A receive-only build still accepts every variant here; it just never names them all.
+#[cfg_attr(not(feature = "encode"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    /// Browser WebTransport only, on the bound address.
+    Browser,
+    /// Additionally an iroh endpoint restricted to loopback, with no relays, address
+    /// publication or DNS. For local tests.
+    Loopback,
+    /// Additionally an iroh endpoint reachable across the internet, announced as a share
+    /// code. Relays carry holepunch coordination; a viewer refuses a relayed media path.
+    Peer,
+}
+#[cfg(feature = "encode")]
 pub struct Publisher {
     pub fingerprint: String,
     _runtime: tokio::runtime::Runtime,
@@ -45,8 +68,9 @@ pub struct Publisher {
     start: Option<u64>,
     format: Option<Format>,
 }
+#[cfg(feature = "encode")]
 impl Publisher {
-    pub fn new(bind: SocketAddr, iroh_local: bool) -> Result<Self> {
+    pub fn new(bind: SocketAddr, transport: Transport) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -63,7 +87,8 @@ impl Publisher {
                 .with_max_age(Duration::from_secs(1)),
         )?;
         broadcast.announce(Default::default())?;
-        let fingerprint = serve(&runtime, origin.consume(), bind, iroh_local)?;
+        // The share code reaches callers on stdout, like the other readiness lines.
+        let (fingerprint, _share_code) = serve(&runtime, origin.consume(), bind, transport)?;
         drop(_enter);
         Ok(Self {
             fingerprint,
@@ -122,26 +147,43 @@ impl Publisher {
         Ok(())
     }
 }
+/// Start the MoQ server. Returns its browser certificate fingerprint, and a share code
+/// when the transport announces one.
 pub fn serve(
     runtime: &tokio::runtime::Runtime,
     origin: origin::Consumer,
     bind: SocketAddr,
-    iroh_local: bool,
-) -> Result<String> {
+    transport: Transport,
+) -> Result<(String, Option<String>)> {
     let mut listen = moq_tokio::listen::Config::default();
     listen.bind = Some(moq_tokio::listen::Bind::Addr(bind));
     listen.tls.generate = vec!["localhost".into(), "127.0.0.1".into()];
     let mut config = moq_tokio::server::Config::default();
     config.listen = listen;
-    if iroh_local {
+    let mut share_code = None;
+    if transport != Transport::Browser {
         #[cfg(feature = "iroh")]
         {
-            let endpoint = runtime.block_on(local_endpoint())?;
-            println!(
-                "IROH_READY id={} address={}",
-                endpoint.id(),
-                endpoint.bound_sockets()[0]
-            );
+            let endpoint = match transport {
+                Transport::Loopback => runtime.block_on(local_endpoint())?,
+                _ => runtime.block_on(crate::peer::endpoint(None))?,
+            };
+            if transport == Transport::Peer {
+                // A relay connection and a direct address have to exist before the code
+                // can describe how to reach this source.
+                let code = runtime.block_on(crate::peer::share_code(
+                    &endpoint,
+                    std::time::Duration::from_secs(15),
+                ))?;
+                println!("IROH_SHARE code={code}");
+                share_code = Some(code);
+            } else {
+                println!(
+                    "IROH_READY id={} address={}",
+                    endpoint.id(),
+                    endpoint.bound_sockets()[0]
+                );
+            }
             config.iroh = Some(endpoint);
         }
         #[cfg(not(feature = "iroh"))]
@@ -159,7 +201,7 @@ pub fn serve(
             eprintln!("MoQ server stopped: {err}");
         }
     });
-    Ok(fingerprint)
+    Ok((fingerprint, share_code))
 }
 #[cfg(feature = "iroh")]
 pub async fn local_endpoint() -> Result<moq_tokio::iroh::Endpoint> {
@@ -173,6 +215,7 @@ pub async fn local_endpoint() -> Result<moq_tokio::iroh::Endpoint> {
         .bind()
         .await?)
 }
+#[cfg(feature = "encode")]
 fn codec(data: &[u8]) -> Option<String> {
     for i in 0..data.len() {
         let p = if data[i..].starts_with(&[0, 0, 0, 1]) {
@@ -197,7 +240,7 @@ fn codec(data: &[u8]) -> Option<String> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encode"))]
 mod tests {
     use super::codec;
     #[test]

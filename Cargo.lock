@@ -2683,6 +2683,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "data-encoding",
  "libc",
  "moq-net",
  "moq-tokio",

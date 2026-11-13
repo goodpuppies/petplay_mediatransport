@@ -16,8 +16,8 @@ little-endian. Ancillary descriptors are owned by the receiver after receipt.
 | 12 | u32 | Flags: 0 means synchronization FD attached; 1 means already signaled |
 | 16 | u64 | Producer sequence, increasing per slot |
 | 24 | u64 | Monotonic capture timestamp, nanoseconds |
-| 32 | u32 | Width, currently 1920 |
-| 36 | u32 | Height, currently 1080 |
+| 32 | u32 | Width, even, 16–8192 |
+| 36 | u32 | Height, even, 16–8192 |
 | 40 | u32 | Plane pitch in bytes |
 | 44 | u32 | Plane offset in bytes |
 | 48 | u64 | DRM modifier, currently linear (0) |
@@ -27,6 +27,12 @@ little-endian. Ancillary descriptors are owned by the receiver after receipt.
 SCM_RIGHTS contains the DMA-BUF FD first, then the ready SYNC_FD when flags are zero.
 The encoder waits for readiness before importing the image as DRM ARGB8888. No raw pixel
 mapping or software conversion fallback is enabled.
+
+The first descriptor fixes the session's geometry; a later change ends the session, because
+the encoded catalog a receiver has already read describes the first one. A producer that
+cannot allocate GPU memory itself may copy into a linear GBM buffer, which is both
+CPU-writable and DMA-BUF exportable, and send that; the encoder cannot tell the difference
+and still never reads back. `screen-streamer --media-socket` does exactly this.
 
 The ACK is exactly 16 bytes: magic u32, slot u32, sequence u64, little-endian. It is returned
 after encoding, publication, and optional recording complete. The producer also checks its GPU
@@ -42,6 +48,10 @@ Broadcast path: `petplay`. The `config` track contains one JSON frame:
 ```
 
 The codec string is derived from the actual encoder SPS; the value above is an example.
+`width` and `height` are the producer's actual geometry. `stereo` is `side-by-side` for a
+stereo source and `none` for a single-view source such as a desktop; the worker's `--layout`
+option decides it, since a frame descriptor does not describe how many views it carries.
+`framerate` is the worker's `--fps`, which also sets the keyframe interval.
 The `video` track uses microsecond MoQ timestamps and creates one group per keyframe. The
 payload of each frame is:
 

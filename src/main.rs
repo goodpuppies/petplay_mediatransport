@@ -151,39 +151,65 @@ fn main() -> Result<()> {
     if args.get(1).is_some_and(|a| a == "gateway") {
         return gateway::run(&args[2..]);
     }
+    let usage = "usage: petplay-media SOCKET OUTPUT.h264 [QUIC_LISTEN_ADDR] \
+        [--iroh-local] [--fps N] [--bitrate BITS_PER_SECOND] [--layout mono|side-by-side]";
+    let mut positional: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut iroh_local = false;
+    let mut framerate = 75u32;
+    let mut bitrate = 12_000_000u32;
+    let mut layout = publish::Layout::SideBySide;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        let text = arg.to_str().context("non-UTF-8 argument")?;
+        if text == "--iroh-local" {
+            iroh_local = true;
+        } else if matches!(text, "--fps" | "--bitrate" | "--layout") {
+            let value = rest
+                .next()
+                .with_context(|| format!("{text} needs a value"))?
+                .to_str()
+                .context("non-UTF-8 option value")?;
+            match text {
+                "--fps" => framerate = value.parse().context("--fps")?,
+                "--bitrate" => bitrate = value.parse().context("--bitrate")?,
+                _ => layout = publish::Layout::parse(value)?,
+            }
+        } else if text.starts_with("--") {
+            bail!("unknown media option {text}; {usage}");
+        } else {
+            positional.push(arg.as_os_str());
+        }
+    }
+    ensure!((2..=3).contains(&positional.len()), "{usage}");
     ensure!(
-        (3..=5).contains(&args.len()),
-        "usage: petplay-media SOCKET OUTPUT.h264 [QUIC_LISTEN_ADDR] [--iroh-local]"
+        (1..=240).contains(&framerate) && (100_000..=200_000_000).contains(&bitrate),
+        "framerate or bitrate out of range"
     );
-    let iroh_local = args.get(4).is_some_and(|a| a == "--iroh-local");
-    ensure!(args.len() != 5 || iroh_local, "unknown media option");
-    let mut publisher = args
-        .get(3)
+    let socket = Path::new(positional[0]);
+    let output_path = Path::new(positional[1]);
+    let recording = output_path != Path::new("-");
+    let mut publisher = positional
+        .get(2)
         .map(|bind| -> Result<_> {
-            let publisher = publish::Publisher::new(
-                bind.to_str().context("invalid listen address")?.parse()?,
-                iroh_local,
-            )?;
-            web::start(
-                bind.to_str().context("invalid listen address")?.parse()?,
-                &publisher.fingerprint,
-            )?;
+            let address = bind.to_str().context("invalid listen address")?.parse()?;
+            let publisher = publish::Publisher::new(address, iroh_local)?;
+            web::start(address, &publisher.fingerprint)?;
             println!(
                 "MOQ_READY listen={} fingerprint={}",
                 bind.to_string_lossy(),
                 publisher.fingerprint
             );
-            if args[2] != "-" {
+            if recording {
                 fs::write(
-                    Path::new(&args[2]).with_extension("certificate.sha256"),
+                    output_path.with_extension("certificate.sha256"),
                     &publisher.fingerprint,
                 )?;
             }
             Ok(publisher)
         })
         .transpose()?;
-    let (listener, _path) = listen(Path::new(&args[1]))?;
-    println!("MEDIA_READY socket={}", Path::new(&args[1]).display());
+    let (listener, _path) = listen(socket)?;
+    println!("MEDIA_READY socket={}", socket.display());
     let client = owned(syscall(
         unsafe {
             libc::accept4(
@@ -195,18 +221,10 @@ fn main() -> Result<()> {
         },
         "accept producer",
     )?);
-    let mut output = if args[2] == "-" {
-        None
-    } else {
-        Some(File::create(&args[2])?)
-    };
-    let mut journal = if args[2] == "-" {
-        None
-    } else {
-        Some(File::create(
-            Path::new(&args[2]).with_extension("frames.jsonl"),
-        )?)
-    };
+    let mut output = recording.then(|| File::create(output_path)).transpose()?;
+    let mut journal = recording
+        .then(|| File::create(output_path.with_extension("frames.jsonl")))
+        .transpose()?;
     let mut encoder: Option<Encoder> = None;
     let mut geometry = None;
     let mut last = [0u64; 3];
@@ -225,8 +243,10 @@ fn main() -> Result<()> {
         ensure!(
             slot < 3
                 && seq > last[slot]
-                && width == 1920
-                && height == 1080
+                && (16..=8192).contains(&width)
+                && (16..=8192).contains(&height)
+                && width % 2 == 0
+                && height % 2 == 0
                 && pitch >= width * 4
                 && pitch <= 65536
                 && offset <= 65536
@@ -240,17 +260,28 @@ fn main() -> Result<()> {
         }
         let image = fds.pop().unwrap();
         if encoder.is_none() {
-            let mut cfg = Config::new(width, height, 75, 12_000_000, 75);
+            let mut cfg = Config::new(width, height, framerate, bitrate, framerate);
             cfg.device = Some("/dev/dri/renderD128".into());
             encoder = Some(Encoder::new(cfg).context("hardware H.264 encoder")?);
             geometry = Some((width, height));
+            if let Some(publisher) = publisher.as_mut() {
+                publisher.describe(publish::Format {
+                    width,
+                    height,
+                    framerate,
+                    layout,
+                });
+            }
+            println!(
+                "MEDIA_SOURCE width={width} height={height} fps={framerate} layout={layout:?}"
+            );
         }
         ensure!(
             geometry == Some((width, height)),
             "stream resize requires a new session"
         );
         let start = Instant::now();
-        let key = frames % 75 == 0;
+        let key = frames % u64::from(framerate) == 0;
         let buffer = DmaBuf {
             drm_format: drm::ARGB8888,
             modifier,
@@ -300,7 +331,7 @@ fn main() -> Result<()> {
         if n != ack.len() as isize {
             bail!("slot release failed: {}", std::io::Error::last_os_error());
         }
-        if frames <= 3 || frames % 75 == 0 {
+        if frames <= 3 || frames % u64::from(framerate) == 0 {
             println!(
                 "MEDIA_ENCODED frames={frames} sequence={seq} bytes={} raw_cpu_bytes=0",
                 encoded.len()

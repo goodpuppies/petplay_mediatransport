@@ -17,8 +17,9 @@ This is an early Linux video prototype, not yet a cross-platform media framework
 - Receive and decode in a WebCodecs browser viewer, with timestamp-based presentation.
 - Optionally record encoded H.264 and a frame journal.
 
-The current feed is fixed at 1920×1080 side-by-side stereo, 75 fps, and 12 Mbps. It uses
-`/dev/dri/renderD128` and a three-slot producer pool. Audio, arbitrary geometry, other GPU APIs,
+The feed's geometry comes from the producer's first frame descriptor; `--fps`, `--bitrate` and
+`--layout mono|side-by-side` set the rest, defaulting to 75 fps, 12 Mbps and side-by-side for
+the SteamVR source. It uses `/dev/dri/renderD128` and a three-slot producer pool. Audio, arbitrary geometry, other GPU APIs,
 other operating systems, and general remote Iroh discovery are not implemented yet. The
 current MoQ tracks are a custom protocol, not a generic Hang catalog.
 
@@ -60,6 +61,21 @@ the same IP at its port plus one. For this example the gateway viewer is
 `http://127.0.0.1:4471/`. Remote browsers need an HTTPS page, access to the gateway's UDP port,
 and WebTransport/WebCodecs support. The viewer pins the generated WebTransport certificate
 using `config.json`; it replaces the configured hostname with the page hostname.
+
+A desktop producer uses the same worker. Start it with the desktop's own geometry and layout,
+then point the capture helper at the socket:
+
+```sh
+target/release/petplay-media "$PWD/_scratch/media.sock" - 127.0.0.1:4450 --iroh-local \
+  --layout mono --fps 60
+../screen-streamer/target/release/screen-streamer --no-input --no-frame-socket \
+  --media-socket="$PWD/_scratch/media.sock"
+```
+
+Linux desktop capture opens a ScreenCast portal dialog unless a restore token already exists.
+Inside PetPlay, set `PETPLAY_DESKTOP_MEDIA_SOCKET` to the worker's socket and the existing
+desktop overlay publishes to it as well as to the overlay. See the parent project's
+`markdown/remote-desktop-stream.md`.
 
 For the PetPlay headless test producer, run from the parent PetPlay checkout while no real
 SteamVR session is active:

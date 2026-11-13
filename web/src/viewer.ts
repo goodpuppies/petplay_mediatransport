@@ -1,4 +1,4 @@
-import { drawStreamFrame, type StreamView } from "./view";
+import { drawStreamFrame, showsWholePicture, type StreamView } from "./view";
 import { attachRemoteInput } from "./input";
 import * as Moq from "@moq/net";
 const canvas = document.querySelector<HTMLCanvasElement>("#video")!;
@@ -22,6 +22,8 @@ for (
 }
 viewSelect.value = view;
 document.querySelector("header")?.append(viewSelect);
+// Replaced by the source's real geometry once the catalog arrives.
+let source = { width: 1920, height: 1080 };
 Object.assign(canvas.style, {
   width: "auto",
   height: "auto",
@@ -30,11 +32,13 @@ Object.assign(canvas.style, {
   margin: "0 auto",
 });
 function updateView() {
-  canvas.width = view === "stereo" ? 1920 : 960;
-  canvas.height = 1080;
+  canvas.width = showsWholePicture(view) ? source.width : source.width / 2;
+  canvas.height = source.height;
   const label = document.querySelector("p");
   if (label) {
-    label.textContent = view === "stereo"
+    label.textContent = view === "full"
+      ? `${source.width}\u00d7${source.height} source`
+      : view === "stereo"
       ? "Left eye · Right eye"
       : "Click a controller to select it, then drag an arrow or rotation ring.";
   }
@@ -102,10 +106,21 @@ async function main() {
   const catalog = active.track("config").subscribe().ordered();
   const meta = await catalog.readJson() as any;
   catalog.close();
+  const even = (n: unknown) =>
+    typeof n === "number" && Number.isInteger(n) && n >= 16 && n <= 8192 &&
+    n % 2 === 0;
   if (
-    meta?.version !== 1 || meta.format !== "annexb" || meta.width !== 1920 ||
-    meta.height !== 1080
+    meta?.version !== 1 || meta.format !== "annexb" || !even(meta.width) ||
+    !even(meta.height)
   ) throw Error("Unsupported video configuration");
+  // A single-view source has no eye halves to choose between.
+  const sideBySide = meta.stereo === "side-by-side";
+  source = { width: meta.width, height: meta.height };
+  if (!sideBySide) {
+    view = "full";
+    viewSelect.remove();
+  }
+  updateView();
   const options = new URLSearchParams(location.search);
   const immediate = options.has("immediate");
   const decoderConfig: VideoDecoderConfig = {
@@ -205,7 +220,7 @@ async function main() {
         lastPresent = now;
         drawStreamFrame(context, ready, canvas, view);
         stats.presented++;
-        if (measure && stats.presented % 15 === 0) {
+        if (measure && sideBySide && stats.presented % 15 === 0) {
           analysis.drawImage(canvas, 0, 0, 480, 270);
           const p = analysis.getImageData(0, 0, 480, 270).data;
           const count = [0, 0], sum = [0, 0];

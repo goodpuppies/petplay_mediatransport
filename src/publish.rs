@@ -2,6 +2,37 @@
 use anyhow::{Context, Result};
 use moq_net::{Timescale, Timestamp, broadcast, group, origin, track};
 use std::{net::SocketAddr, time::Duration};
+/// How one encoded picture carries the source's views.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layout {
+    /// One view filling the picture, such as a desktop or a single camera.
+    Mono,
+    /// Two views of equal width, left then right.
+    SideBySide,
+}
+impl Layout {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "mono" | "none" => Ok(Self::Mono),
+            "side-by-side" | "sbs" => Ok(Self::SideBySide),
+            other => anyhow::bail!("unknown layout {other}"),
+        }
+    }
+    fn catalog(self) -> &'static str {
+        match self {
+            Self::Mono => "none",
+            Self::SideBySide => "side-by-side",
+        }
+    }
+}
+/// The source geometry a receiver needs before the first access unit.
+#[derive(Clone, Copy, Debug)]
+pub struct Format {
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub layout: Layout,
+}
 pub struct Publisher {
     pub fingerprint: String,
     _runtime: tokio::runtime::Runtime,
@@ -12,6 +43,7 @@ pub struct Publisher {
     group: Option<group::Producer>,
     sequence: u64,
     start: Option<u64>,
+    format: Option<Format>,
 }
 impl Publisher {
     pub fn new(bind: SocketAddr, iroh_local: bool) -> Result<Self> {
@@ -43,7 +75,13 @@ impl Publisher {
             group: None,
             sequence: 0,
             start: None,
+            format: None,
         })
+    }
+    /// Record the source geometry. The producer's first descriptor decides it, so this
+    /// runs once the encoder exists and always before the first published frame.
+    pub fn describe(&mut self, format: Format) {
+        self.format = Some(format);
     }
     pub fn frame(&mut self, bytes: &[u8], key: bool, timestamp: u64) -> Result<()> {
         let start = *self.start.get_or_insert(timestamp);
@@ -52,8 +90,15 @@ impl Publisher {
             // Annex-B SPS is carried in-band. Discover profile/compatibility/level
             // from the actual encoder output rather than guessing a codec string.
             let codec = codec(bytes).context("first frame has no SPS")?;
+            let Format {
+                width,
+                height,
+                framerate,
+                layout,
+            } = self.format.context("publish before the source geometry is known")?;
+            let stereo = layout.catalog();
             let json = format!(
-                "{{\"version\":1,\"codec\":\"{codec}\",\"width\":1920,\"height\":1080,\"framerate\":75,\"stereo\":\"side-by-side\",\"timestamp\":\"microseconds\",\"format\":\"annexb\"}}"
+                "{{\"version\":1,\"codec\":\"{codec}\",\"width\":{width},\"height\":{height},\"framerate\":{framerate},\"stereo\":\"{stereo}\",\"timestamp\":\"microseconds\",\"format\":\"annexb\"}}"
             );
             let mut group = self._config.append_group()?;
             group.write_frame(Timestamp::now(), json)?;

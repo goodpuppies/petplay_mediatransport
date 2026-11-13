@@ -1,6 +1,50 @@
+import { drawStreamFrame, type StreamView } from "./view";
+import { attachRemoteInput } from "./input";
 import * as Moq from "@moq/net";
 const canvas = document.querySelector<HTMLCanvasElement>("#video")!;
 const context = canvas.getContext("2d", { alpha: false })!;
+const requestedView = new URLSearchParams(location.search).get("view");
+let view: StreamView = requestedView === "left" || requestedView === "stereo"
+  ? requestedView
+  : "right";
+const viewSelect = document.createElement("select");
+viewSelect.setAttribute("aria-label", "Video view");
+for (
+  const [value, label] of [["right", "Single eye"], ["left", "Left eye"], [
+    "stereo",
+    "Stereo",
+  ]]
+) {
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = label;
+  viewSelect.append(option);
+}
+viewSelect.value = view;
+document.querySelector("header")?.append(viewSelect);
+Object.assign(canvas.style, {
+  width: "auto",
+  height: "auto",
+  maxWidth: "100%",
+  maxHeight: "calc(100dvh - 140px)",
+  margin: "0 auto",
+});
+function updateView() {
+  canvas.width = view === "stereo" ? 1920 : 960;
+  canvas.height = 1080;
+  const label = document.querySelector("p");
+  if (label) {
+    label.textContent = view === "stereo"
+      ? "Left eye · Right eye"
+      : "Click a controller to select it, then drag an arrow or rotation ring.";
+  }
+}
+updateView();
+viewSelect.onchange = () => {
+  view = viewSelect.value as StreamView;
+  updateView();
+};
+
 const status = document.querySelector("#status")!;
 const stats = {
   connected: false,
@@ -42,6 +86,10 @@ async function main() {
     webtransport: { serverCertificateHashes: [{ value: config.fingerprint }] },
     signal: AbortSignal.timeout(10000),
   });
+  const inputAddress = new URLSearchParams(location.search).get("input");
+  const closeInput = inputAddress
+    ? attachRemoteInput(canvas, inputAddress, () => view)
+    : undefined;
   stats.connected = true;
   stats.transport = connection.transport;
   status.textContent = "Connected · waiting for video";
@@ -155,7 +203,7 @@ async function main() {
           sample(stats.presentationIntervals, now - lastPresent);
         }
         lastPresent = now;
-        context.drawImage(ready, 0, 0, canvas.width, canvas.height);
+        drawStreamFrame(context, ready, canvas, view);
         stats.presented++;
         if (measure && stats.presented % 15 === 0) {
           analysis.drawImage(canvas, 0, 0, 480, 270);
@@ -191,7 +239,7 @@ async function main() {
       lastDecodedAt = now;
       if (immediate) {
         try {
-          context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          drawStreamFrame(context, frame, canvas, view);
           stats.presented++;
         } catch (error) {
           stats.errors.push(`Presentation: ${error}`);
@@ -310,6 +358,7 @@ async function main() {
     }
   } finally {
     stopped = true;
+    closeInput?.();
     clearInterval(diagnostics);
     cancelAnimationFrame(animation);
     clearPending();

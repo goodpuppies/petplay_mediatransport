@@ -106,3 +106,22 @@ As additional feeds and platforms arrive, separate platform ingress/codec adapte
 media publication and reception. Already encoded feeds should be able to forward without
 re-encoding. Add those boundaries around real consumers rather than making the Linux GPU
 prototype the universal interface.
+
+## Optional raw scene input
+
+The existing stream viewer accepts an `input` query parameter containing a WebSocket URL, for
+example `?input=ws%3A%2F%2F127.0.0.1%3A3991%2Finput`. This enables a thin pointer/wheel sender
+on the video canvas. It reports normalized coordinates over the complete side-by-side stream,
+buttons, modifiers, and pointer identities. It does not render or interpret the PetPlay scene.
+PetPlay owns stereo eye selection, camera rays, pmndrs events, capture, and gizmos.
+
+Input is currently a separate ordered WebSocket connection to PetPlay. Remote HTTPS viewers
+need a reachable `wss:` endpoint, and PetPlay must allow the exact viewer origin. Omitting the
+query parameter keeps the viewer receive-only. See the parent PetPlay project's
+`markdown/remote-scene-controls.md` for the opt-in scene and driver configuration.
+
+The viewer now defaults to a single right-eye view. Its view selector also offers the left eye
+and stereo (`?view=left` or `?view=stereo` set the initial choice). This crops the existing
+side-by-side decoded feed; the native stream remains stereo. Pointer coordinates are mapped
+back into the selected source eye before sending, including during captured drags. Canvas
+aspect ratio is preserved on narrow screens so CSS scaling does not offset picking.

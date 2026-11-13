@@ -1,0 +1,11 @@
+{
+  "name": "petplay-media-viewer",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@moq/net": "0.4.7" },
+  "devDependencies": { "typescript": "5.9.3" },
+  "scripts": {
+    "build": "bun build src/viewer.ts --outfile dist/viewer.js --target browser",
+    "check": "tsc --noEmit"
+  }
+}

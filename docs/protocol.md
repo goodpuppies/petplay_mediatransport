@@ -62,3 +62,30 @@ payload of each frame is:
 
 The producer advertises a one-second retention window. The gateway forwards encoded tracks
 without transcoding. Receivers must resume decoding at a keyframe after losing reference data.
+
+
+## Native receiver output
+
+The Linux `receive` command is a producer of the same 64-byte PPM1 descriptor and consumes the
+same 16-byte ACK. Differences from capture ingress:
+
+- Flags are always 1, with exactly one DMA-BUF FD; GPU color conversion has completed before
+  transfer, so there is no extra synchronization FD.
+- The image is linear DRM ARGB8888 / Vulkan B8G8R8A8_UNORM, offset zero, one plane. Source
+  orientation is top-down. The initial dimensions are fixed for the session.
+- The timestamp is the source's stream-relative microsecond timestamp multiplied by 1000,
+  expressed in nanoseconds. It is not a synchronized receiver wall clock.
+- There are three reusable slots. A slot remains unavailable until an exact slot/sequence ACK
+  arrives. Unknown, duplicate, stale, or incorrectly sized ACKs terminate the receiver.
+- A full output pool drops presentation frames while continuing to decode reference frames.
+  A full encoded-input queue skips through the next keyframe and resets decoder references.
+
+A consumer may ACK a frame it never imported immediately. After importing one, it must finish
+all GPU reads before ACKing; closing its FD alone does not authorize buffer reuse. PetPlay
+imports through EGL, blits into its own GL texture, and calls `glFinish` before ACKing. This
+separates reusable transport storage from the texture OpenVR consumes asynchronously.
+
+Only version-1 mono Annex-B H.264 catalogs are accepted. Catalog and decoded dimensions must
+agree; resizing requires a fresh session. Consumer disconnect closes the receiver and removes
+its socket, including when initialization fails after binding. Network errors terminate the
+session rather than reconnecting silently.

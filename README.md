@@ -16,6 +16,7 @@ This is an early Linux video prototype, not yet a cross-platform media framework
   Iroh endpoint announced as a share code.
 - Relay MoQ tracks from Iroh to browser WebTransport without decoding or re-encoding.
 - Receive and decode in a WebCodecs browser viewer, with timestamp-based presentation.
+- Decode a mono H.264 subscription on Linux VA-API and export synchronized RGB DMA-BUF slots.
 - Optionally record encoded H.264 and a frame journal.
 
 The feed's geometry comes from the producer's first frame descriptor; `--fps`, `--bitrate` and
@@ -127,6 +128,30 @@ The lab owns SteamVR startup, restoration, and shutdown. The native worker accep
 producer session and exits if it disconnects. SteamVR's current lab teardown can abort the
 compositor and reset that connection; graceful shutdown is unfinished.
 
+## Native Linux GPU receiver
+
+Build with `cargo build --release --features decode` (or add `--no-default-features` for a
+receiver without the encoder). A mono source started with `--layout mono` is required:
+
+```sh
+target/release/petplay-media receive SHARE_CODE /PRIVATE_DIRECTORY/frames.sock
+# Local transport test instead of a share code:
+target/release/petplay-media receive iroh://SOURCE_ID/ SOURCE_ADDRESS /PRIVATE_DIRECTORY/frames.sock
+```
+
+The worker binds a mode-0600 Unix seqpacket socket, prints `RECEIVER_READY`, and waits for its
+local consumer before subscribing. Share codes use the same direct-route gate and route-loss
+policy as the gateway. It decodes to NV12 DMA-BUFs, converts to a three-slot linear RGB GBM
+pool on the GPU, and transfers descriptors rather than raw pixels. There is no CPU decoder or
+pixel download fallback. `/dev/dri/renderD128` is currently fixed.
+
+The consumer must honor [the output ACK contract](docs/protocol.md#native-receiver-output).
+PetPlay's `remoteMediaOverlay` actor supplies that consumer and an EGL-backed GL texture for
+OpenVR. It performs a GPU copy into presentation-owned storage before ACKing a slot. This is
+zero CPU raw-frame transfer, with GPU color conversion and a presentation copy. It is not a
+copy-free path. Windows native reception remains unimplemented; its browser gateway still
+builds independently of VA-API.
+
 ## Viewer diagnostics
 
 The viewer shows receive, decode, and presentation counters. `window.petplayStream` contains
@@ -147,6 +172,8 @@ necessarily skips some source frames.
 ## Layout and next boundaries
 
 - `src/source.rs`: Linux DMA-BUF ingestion, synchronization, VAAPI encoding, recording, ACKs.
+- `src/receive.rs`: native MoQ subscription, bounded decode queue, and VA-API decoding.
+- `src/receive_output.rs`: GPU color conversion, GBM slots, descriptor transfer, exact ACKs.
 - `src/publish.rs`: custom MoQ tracks and native transport endpoints.
 - `src/peer.rs`: share codes, the peer endpoint, and the direct-path requirement.
 - `src/gateway.rs`: Iroh-to-WebTransport relay.

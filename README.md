@@ -188,6 +188,15 @@ media publication and reception. Already encoded feeds should be able to forward
 re-encoding. Add those boundaries around real consumers rather than making the Linux GPU
 prototype the universal interface.
 
+## WebXR client
+
+For a side-by-side stream, the viewer offers "Enter VR" when the browser supports
+`immersive-vr` (`web/src/xr.ts`). Each eye's half is drawn at the source frustum in that eye's
+view space. `?xr=wss://HOST/xr` streams head pose, grip poses and gamepad state every XR frame
+to PetPlay's XR bridge, which drives the synthetic SteamVR headset and controllers. The bridge
+replies with the source's FOV tangents. There is no reprojection yet. See the parent project's
+`markdown/webxr-client.md`.
+
 ## Optional raw scene input
 
 The existing stream viewer accepts an `input` query parameter containing a WebSocket URL, for

@@ -1,5 +1,6 @@
 import { drawStreamFrame, showsWholePicture, type StreamView } from "./view";
 import { attachRemoteInput } from "./input";
+import { startXr, xrSupported } from "./xr";
 import * as Moq from "@moq/net";
 const canvas = document.querySelector<HTMLCanvasElement>("#video")!;
 const context = canvas.getContext("2d", { alpha: false })!;
@@ -188,8 +189,9 @@ async function main() {
     pending.length = 0;
     clockSource = undefined;
   }
-  function present(now: number) {
-    if (stopped) return;
+  // While a WebXR session runs, its frame loop takes pictures instead of the page canvas.
+  let xrActive = false;
+  function takeDue(now: number): VideoFrame | undefined {
     stats.clock = {
       now,
       local: clockLocal,
@@ -209,17 +211,24 @@ async function main() {
       ready = pending.shift();
     }
     if (ready) {
+      sample(
+        stats.presentationLateness,
+        now - (clockLocal + (ready.timestamp - clockSource!) / 1000),
+      );
+      if (lastPresent !== undefined) {
+        sample(stats.presentationIntervals, now - lastPresent);
+      }
+      lastPresent = now;
+      stats.presented++;
+    }
+    return ready;
+  }
+  function present(now: number) {
+    if (stopped) return;
+    const ready = xrActive ? undefined : takeDue(now);
+    if (ready) {
       try {
-        sample(
-          stats.presentationLateness,
-          now - (clockLocal + (ready.timestamp - clockSource!) / 1000),
-        );
-        if (lastPresent !== undefined) {
-          sample(stats.presentationIntervals, now - lastPresent);
-        }
-        lastPresent = now;
         drawStreamFrame(context, ready, canvas, view);
-        stats.presented++;
         if (measure && sideBySide && stats.presented % 15 === 0) {
           analysis.drawImage(canvas, 0, 0, 480, 270);
           const p = analysis.getImageData(0, 0, 480, 270).data;
@@ -252,7 +261,7 @@ async function main() {
       stats.decoded++;
       const now = performance.now();
       lastDecodedAt = now;
-      if (immediate) {
+      if (immediate && !xrActive) {
         try {
           drawStreamFrame(context, frame, canvas, view);
           stats.presented++;
@@ -293,6 +302,34 @@ async function main() {
   });
   decoder.configure(decoderConfig);
   let waitingForKey = true;
+  let endXr: (() => void) | undefined;
+  if (sideBySide && await xrSupported()) {
+    const button = document.createElement("button");
+    button.textContent = "Enter VR";
+    document.querySelector("header")?.append(button);
+    button.onclick = async () => {
+      if (endXr) return endXr();
+      try {
+        endXr = await startXr({
+          takeFrame: takeDue,
+          bridge: options.get("xr") ?? undefined,
+          angularVelocity: options.has("xrAngular"),
+          status: (text) => status.textContent = text,
+          onEnd: () => {
+            xrActive = false;
+            endXr = undefined;
+            button.textContent = "Enter VR";
+          },
+        });
+        clearPending();
+        xrActive = true;
+        button.textContent = "Exit VR";
+      } catch (error) {
+        stats.errors.push(`XR: ${error}`);
+        status.textContent = `XR: ${error}`;
+      }
+    };
+  }
   const video = active.track("video").subscribe();
   try {
     for (;;) {
@@ -373,6 +410,7 @@ async function main() {
     }
   } finally {
     stopped = true;
+    endXr?.();
     closeInput?.();
     clearInterval(diagnostics);
     cancelAnimationFrame(animation);

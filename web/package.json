@@ -5,7 +5,8 @@
   "dependencies": { "@moq/net": "0.4.7" },
   "devDependencies": { "typescript": "5.9.3" },
   "scripts": {
-    "build": "bun build src/viewer.ts --outfile dist/viewer.js --target browser",
+    "build": "bun build src/viewer.ts --outfile dist/viewer.js --target browser && bun run build:presenter",
+    "build:presenter": "bun build src/presenter.ts --outfile dist/presenter.js --target browser --format esm",
     "check": "tsc --noEmit"
   }
 }

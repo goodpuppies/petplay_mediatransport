@@ -17,7 +17,7 @@ use std::{
         unix::fs::MetadataExt,
     },
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use crate::{publish, web};
 const FRAME: usize = 64;
@@ -149,15 +149,22 @@ fn wait_ready(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 /// Run the encoding source. `args` is the full argument list, including the program name.
+#[path = "pose_ring.rs"]
+mod pose_ring;
+pub use pose_ring::Pose;
 pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let usage = "usage: petplay-media SOCKET OUTPUT.h264 [QUIC_LISTEN_ADDR] \
         [--iroh-local|--iroh-share] [--fps N] [--bitrate BITS_PER_SECOND] \
-        [--layout mono|side-by-side]";
+        [--layout mono|side-by-side] [--pose-ring PATH] [--pose-lag-us N]";
     let mut positional: Vec<&std::ffi::OsStr> = Vec::new();
     let mut transport = publish::Transport::Browser;
     let mut framerate = 75u32;
     let mut bitrate = 12_000_000u32;
     let mut layout = publish::Layout::SideBySide;
+    // The driver's head-pose ring. It latches one pose per display frame shortly before each
+    // tick, so a frame's pose is the newest latched at capture (minus an optional lag).
+    let mut pose_path: Option<std::path::PathBuf> = None;
+    let mut pose_lag_us = 0u64;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         let text = arg.to_str().context("non-UTF-8 argument")?;
@@ -171,6 +178,18 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             } else {
                 publish::Transport::Peer
             };
+        } else if matches!(text, "--pose-ring" | "--pose-lag-us") {
+            let value = rest
+                .next()
+                .with_context(|| format!("{text} needs a value"))?
+                .to_str()
+                .context("non-UTF-8 option value")?;
+            if text == "--pose-ring" {
+                pose_path = Some(value.into());
+            } else {
+                pose_lag_us = value.parse().context("--pose-lag-us")?;
+                ensure!(pose_lag_us <= 100_000, "--pose-lag-us out of range");
+            }
         } else if matches!(text, "--fps" | "--bitrate" | "--layout") {
             let value = rest
                 .next()
@@ -238,6 +257,17 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let mut last = [0u64; 3];
     let mut frames = 0u64;
     let mut position = 0u64;
+    let mut pose_ring: Option<pose_ring::PoseRing> = None;
+    let mut pose_retry = Instant::now();
+    let mut tagged = 0u64;
+    // Per second of video, in microseconds: where captures fall after the display tick, and
+    // the head pose's path from arrival at the driver to publication of its frame.
+    let mut timing: [Vec<u64>; 4] = Default::default();
+    let monotonic = || {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+        t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+    };
     while let Some((b, mut fds)) = receive(&client)? {
         let slot = u32at(&b, 8) as usize;
         let seq = u64at(&b, 16);
@@ -307,6 +337,52 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         ensure!(!encoded.is_empty(), "empty encoded frame");
         if let Some(publisher) = publisher.as_mut() {
             publisher.frame(&encoded, key, timestamp)?;
+            // The driver creates the ring when SteamVR starts, usually after this worker.
+            if let Some(path) = pose_path.as_ref().filter(|_| pose_ring.is_none()) {
+                if pose_retry.elapsed() > Duration::from_secs(1) || frames == 0 {
+                    pose_retry = Instant::now();
+                    match pose_ring::PoseRing::open(path) {
+                        Ok(ring) => {
+                            println!("POSE_RING_READY path={}", path.display());
+                            pose_ring = Some(ring);
+                        }
+                        Err(err) if frames % u64::from(framerate) == 0 => {
+                            println!("POSE_RING_WAITING {err:#}")
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            let sampled = timestamp.saturating_sub(pose_lag_us * 1000);
+            if let Some(pose) = pose_ring.as_ref().and_then(|ring| ring.at(sampled)) {
+                let age = ((timestamp - pose.time_ns.min(timestamp)) / 1000).min(u64::from(u32::MAX));
+                publisher.pose(timestamp, &pose, age as u32)?;
+                tagged += 1;
+                let hz = u128::from(framerate);
+                let phase = ((u128::from(timestamp) * hz % 1_000_000_000) / hz / 1000) as u64;
+                let published = monotonic();
+                for (series, value) in timing.iter_mut().zip([
+                    phase,
+                    pose.time_ns.saturating_sub(pose.held_ns) / 1000,
+                    age,
+                    published.saturating_sub(timestamp) / 1000,
+                ]) {
+                    series.push(value);
+                }
+                if tagged % u64::from(framerate) == 0 {
+                    let summary = |v: &mut Vec<u64>| {
+                        v.sort_unstable();
+                        let text = format!("{}/{}", v[v.len() / 2], v[v.len() - 1]);
+                        v.clear();
+                        text
+                    };
+                    let [phase, wait, latch, publish] = &mut timing;
+                    println!(
+                        "POSE_TIMING_US median/max capture_after_tick={} arrival_to_latch={} latch_to_capture={} capture_to_published={} sequence={}",
+                        summary(phase), summary(wait), summary(latch), summary(publish), pose.client_sequence
+                    );
+                }
+            }
         }
         if let Some(output) = output.as_mut() {
             output.write_all(&encoded)?;

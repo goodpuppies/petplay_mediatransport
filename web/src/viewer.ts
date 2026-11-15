@@ -1,6 +1,6 @@
 import { drawStreamFrame, showsWholePicture, type StreamView } from "./view";
 import { attachRemoteInput } from "./input";
-import { startXr, xrSupported } from "./xr";
+import { sessionInit, type SourcePose, startXr, type XrStats, xrSupported } from "./xr";
 import * as Moq from "@moq/net";
 const canvas = document.querySelector<HTMLCanvasElement>("#video")!;
 const context = canvas.getContext("2d", { alpha: false })!;
@@ -69,6 +69,26 @@ const stats = {
   arrivalIntervals: [] as number[],
   presentationIntervals: [] as number[],
   presentationLateness: [] as number[],
+  xr: {
+    latencyMs: [],
+    warpDegrees: [],
+    posed: 0,
+    unposed: 0,
+    presenterErrors: [],
+  } as XrStats,
+  poseAgeUs: [] as number[],
+  /** Decoded pictures XR lets wait behind the one shown (0–3). */
+  xrQueue: Number(new URLSearchParams(location.search).get("xrQueue") ?? 1),
+  xrWaiting: [] as number[],
+  /** Browser-side latency of each picture shown in XR, in milliseconds. */
+  xrReceiveToDecoded: [] as number[],
+  xrDecodedToShown: [] as number[],
+};
+// When each picture (by timestamp) arrived and finished decoding, for the XR breakdown.
+const arrivedAt = new Map<number, number>(), decodedAt = new Map<number, number>();
+const remember = (map: Map<number, number>, key: number, value: number) => {
+  map.set(key, value);
+  if (map.size > 120) map.delete(map.keys().next().value!);
 };
 (window as any).petplayStream = stats;
 const measure = new URLSearchParams(location.search).has("measure");
@@ -191,7 +211,14 @@ async function main() {
   }
   // While a WebXR session runs, its frame loop takes pictures instead of the page canvas.
   let xrActive = false;
-  function takeDue(now: number): VideoFrame | undefined {
+  /**
+   * The picture to show now. The page canvas jumps to the newest due picture on a buffered
+   * clock. XR ignores that buffer: it shows the oldest decoded picture, one per display frame,
+   * and drops older ones so that at most `stats.xrQueue` wait behind it. In order, a source at
+   * the headset's rate shows every picture once; a queue that never drains would otherwise
+   * add whole frames of latency. Timewarp hides the rare repeated picture.
+   */
+  function takeDue(now: number, inOrder = false): VideoFrame | undefined {
     stats.clock = {
       now,
       local: clockLocal,
@@ -200,8 +227,25 @@ async function main() {
       length: pending.length,
     };
     let ready: VideoFrame | undefined;
+    if (inOrder) {
+      // Live-tunable from DevTools: window.petplayStream.xrQueue.
+      const keep = Math.max(0, Math.min(3, Math.floor(stats.xrQueue)));
+      while (pending.length > keep + 1) {
+        pending.shift()!.close();
+        stats.presentationDropped++;
+      }
+      ready = pending.shift();
+      sample(stats.xrWaiting, pending.length);
+      if (ready) {
+        const arrived = arrivedAt.get(ready.timestamp), decoded = decodedAt.get(ready.timestamp);
+        if (arrived !== undefined && decoded !== undefined) {
+          sample(stats.xrReceiveToDecoded, decoded - arrived);
+          sample(stats.xrDecodedToShown, now - decoded);
+        }
+      }
+    }
     while (
-      pending.length && clockSource !== undefined &&
+      !inOrder && pending.length && clockSource !== undefined &&
       clockLocal + (pending[0].timestamp - clockSource) / 1000 <= now
     ) {
       if (ready) {
@@ -210,7 +254,7 @@ async function main() {
       }
       ready = pending.shift();
     }
-    if (ready) {
+    if (ready && clockSource !== undefined) {
       sample(
         stats.presentationLateness,
         now - (clockLocal + (ready.timestamp - clockSource!) / 1000),
@@ -260,6 +304,7 @@ async function main() {
     output(frame) {
       stats.decoded++;
       const now = performance.now();
+      remember(decodedAt, frame.timestamp, now);
       lastDecodedAt = now;
       if (immediate && !xrActive) {
         try {
@@ -303,15 +348,44 @@ async function main() {
   decoder.configure(decoderConfig);
   let waitingForKey = true;
   let endXr: (() => void) | undefined;
+  // Head pose each picture was rendered for, by video timestamp (microseconds).
+  const poses = new Map<number, SourcePose>();
+  const poseTrack = active.track("pose").subscribe();
+  (async () => {
+    for (;;) {
+      const group = await poseTrack.recvGroup();
+      if (!group) return;
+      for (;;) {
+        const frame = await group.readFrame();
+        if (!frame) break;
+        const p = frame.payload;
+        if (p.length !== 48) continue;
+        const v = new DataView(p.buffer, p.byteOffset, 48);
+        const f = (i: number) => v.getFloat32(i, true);
+        const pose: SourcePose = {
+          sequence: Number(v.getBigUint64(8, true)),
+          rotation: [f(16), f(20), f(24), f(28)],
+          position: [f(32), f(36), f(40)],
+          ageUs: v.getUint32(44, true),
+        };
+        poses.set(Number(v.getBigUint64(0)), pose);
+        sample(stats.poseAgeUs, pose.ageUs);
+        if (poses.size > 300) poses.delete(poses.keys().next().value!);
+      }
+    }
+  })().catch((error) => stats.errors.push(`Pose track: ${error}`));
   if (sideBySide && await xrSupported()) {
     const button = document.createElement("button");
     button.textContent = "Enter VR";
     document.querySelector("header")?.append(button);
-    button.onclick = async () => {
-      if (endXr) return endXr();
+    const enter = async (granted?: XRSession) => {
       try {
         endXr = await startXr({
-          takeFrame: takeDue,
+          takeFrame: (now) => takeDue(now, true),
+          framerate: meta.framerate,
+          poseFor: (timestamp) => poses.get(timestamp),
+          warp: options.get("warp") !== "0",
+          stats: stats.xr,
           bridge: options.get("xr") ?? undefined,
           angularVelocity: options.has("xrAngular"),
           status: (text) => status.textContent = text,
@@ -319,16 +393,27 @@ async function main() {
             xrActive = false;
             endXr = undefined;
             button.textContent = "Enter VR";
+            offer();
           },
-        });
+        }, granted);
         clearPending();
         xrActive = true;
         button.textContent = "Exit VR";
       } catch (error) {
         stats.errors.push(`XR: ${error}`);
         status.textContent = `XR: ${error}`;
+        offer();
       }
     };
+    // The browser's own "enter VR" prompt, available without finding the page button. The
+    // offer is withdrawn when the page button starts a session first.
+    const offer = () => {
+      navigator.xr?.offerSession?.("immersive-vr", sessionInit)
+        .then((session) => endXr ? session.end() : enter(session))
+        .catch(() => {});
+    };
+    button.onclick = () => endXr ? endXr() : enter();
+    offer();
   }
   const video = active.track("video").subscribe();
   try {
@@ -349,6 +434,7 @@ async function main() {
             new DataView(p.buffer, p.byteOffset + 1, 8).getBigUint64(0),
           );
           const arrival = performance.now();
+          remember(arrivedAt, timestamp, arrival);
           lastReceivedAt = arrival;
           if (lastArrival !== undefined) {
             sample(stats.arrivalIntervals, arrival - lastArrival);
@@ -411,6 +497,7 @@ async function main() {
   } finally {
     stopped = true;
     endXr?.();
+    poseTrack.close();
     closeInput?.();
     clearInterval(diagnostics);
     cancelAnimationFrame(animation);

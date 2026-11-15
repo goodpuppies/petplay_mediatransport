@@ -13,8 +13,10 @@ pub fn start(quic: SocketAddr, fingerprint: &str) -> Result<()> {
     );
     let listener = TcpListener::bind(http)?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web");
-    let html = std::fs::read(root.join("index.html"))?;
-    let js = std::fs::read(root.join("dist/viewer.js"))
+    // Checked once so a missing build fails at startup; served fresh on every request, so a
+    // rebuilt viewer reaches browsers without restarting the gateway.
+    std::fs::metadata(root.join("index.html"))?;
+    std::fs::metadata(root.join("dist/viewer.js"))
         .context("run bun install and bun run build in the mediatransport web/ directory")?;
     let config =
         format!("{{\"url\":\"https://{quic}/\",\"fingerprint\":\"{fingerprint}\"}}").into_bytes();
@@ -31,18 +33,35 @@ pub fn start(quic: SocketAddr, fingerprint: &str) -> Result<()> {
             let mut parts = line.lines().next().unwrap_or("").split_whitespace();
             let method = parts.next().unwrap_or("");
             let path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
+            let file = |name: &str| std::fs::read(root.join(name)).ok();
+            let modified = |name: &str| {
+                std::fs::metadata(root.join(name))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis().to_string().into_bytes())
+            };
+            let found = |mime, body: Option<Vec<u8>>| match body {
+                Some(body) => ("200 OK", mime, body),
+                None => ("404 Not Found", "text/plain", b"Not found".to_vec()),
+            };
             let (code, mime, body) = if method != "GET" {
                 (
                     "405 Method Not Allowed",
                     "text/plain",
-                    b"GET required".as_slice(),
+                    b"GET required".to_vec(),
                 )
             } else {
                 match path {
-                    "/" => ("200 OK", "text/html; charset=utf-8", html.as_slice()),
-                    "/viewer.js" => ("200 OK", "text/javascript; charset=utf-8", js.as_slice()),
-                    "/config.json" => ("200 OK", "application/json", config.as_slice()),
-                    _ => ("404 Not Found", "text/plain", b"Not found".as_slice()),
+                    "/" => found("text/html; charset=utf-8", file("index.html")),
+                    "/viewer.js" => found("text/javascript; charset=utf-8", file("dist/viewer.js")),
+                    // A hot-swappable XR presenter, and its build stamp for change polling.
+                    "/presenter.js" => {
+                        found("text/javascript; charset=utf-8", file("dist/presenter.js"))
+                    }
+                    "/build" => found("text/plain", modified("dist/presenter.js")),
+                    "/config.json" => ("200 OK", "application/json", config.clone()),
+                    _ => found("text/plain", None),
                 }
             };
             let header = format!(
@@ -51,7 +70,7 @@ pub fn start(quic: SocketAddr, fingerprint: &str) -> Result<()> {
             );
             let _ = client
                 .write_all(header.as_bytes())
-                .and_then(|()| client.write_all(body));
+                .and_then(|()| client.write_all(&body));
         }
     });
     println!("VIEWER_READY http://{http}/");

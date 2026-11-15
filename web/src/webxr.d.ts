@@ -5,6 +5,11 @@ interface XRSystem {
     mode: "immersive-vr",
     init?: { requiredFeatures?: string[]; optionalFeatures?: string[] },
   ): Promise<XRSession>;
+  /** Lets the browser show its own entry prompt; resolves with the session it starts. */
+  offerSession?(
+    mode: "immersive-vr",
+    init?: { requiredFeatures?: string[]; optionalFeatures?: string[] },
+  ): Promise<XRSession>;
 }
 interface Navigator {
   readonly xr?: XRSystem;
@@ -74,5 +79,8 @@ interface XRSession extends EventTarget {
   updateRenderState(state: { baseLayer?: XRWebGLLayer; depthNear?: number; depthFar?: number }): void;
   requestReferenceSpace(type: "local-floor" | "local"): Promise<XRReferenceSpace>;
   requestAnimationFrame(callback: (time: number, frame: XRFrame) => void): number;
+  readonly supportedFrameRates?: Float32Array;
+  readonly frameRate?: number;
+  updateTargetFrameRate?(rate: number): Promise<void>;
   end(): Promise<void>;
 }

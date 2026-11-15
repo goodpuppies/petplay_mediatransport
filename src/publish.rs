@@ -67,6 +67,9 @@ pub struct Publisher {
     sequence: u64,
     start: Option<u64>,
     format: Option<Format>,
+    /// Head pose each frame was rendered for; one group per video group.
+    pose: track::Producer,
+    pose_group: Option<(u64, group::Producer)>,
 }
 #[cfg(feature = "encode")]
 impl Publisher {
@@ -86,6 +89,12 @@ impl Publisher {
                 .with_timescale(Timescale::MICRO)
                 .with_max_age(Duration::from_secs(1)),
         )?;
+        let pose = broadcast.create_track(
+            "pose",
+            track::Info::default()
+                .with_timescale(Timescale::MICRO)
+                .with_max_age(Duration::from_secs(1)),
+        )?;
         broadcast.announce(Default::default())?;
         // The share code reaches callers on stdout, like the other readiness lines.
         let (fingerprint, _share_code) = serve(&runtime, origin.consume(), bind, transport)?;
@@ -101,12 +110,41 @@ impl Publisher {
             sequence: 0,
             start: None,
             format: None,
+            pose,
+            pose_group: None,
         })
     }
     /// Record the source geometry. The producer's first descriptor decides it, so this
     /// runs once the encoder exists and always before the first published frame.
     pub fn describe(&mut self, format: Format) {
         self.format = Some(format);
+    }
+    /// Publish the head pose the latest `frame` was rendered for, under the same timestamp.
+    /// Payload (48 bytes): u64 BE microseconds as in `video`; then little-endian u64 client
+    /// sequence, f32 rotation xyzw, f32 position xyz, u32 pose age at capture in microseconds.
+    pub fn pose(&mut self, timestamp: u64, pose: &crate::source::Pose, age_us: u32) -> Result<()> {
+        let Some(start) = self.start else { return Ok(()) };
+        let micros = (timestamp - start) / 1000;
+        let video_group = self.sequence.saturating_sub(1);
+        if self.pose_group.as_ref().is_none_or(|(n, _)| *n != video_group) {
+            if let Some((_, g)) = self.pose_group.take() {
+                g.finish()?;
+            }
+            self.pose_group = Some((video_group, self.pose.create_group(video_group.into())?));
+        }
+        let mut data = Vec::with_capacity(48);
+        data.extend_from_slice(&micros.to_be_bytes());
+        data.extend_from_slice(&pose.client_sequence.to_le_bytes());
+        for v in pose.rotation.iter().chain(pose.position.iter()) {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.extend_from_slice(&age_us.to_le_bytes());
+        self.pose_group
+            .as_mut()
+            .unwrap()
+            .1
+            .write_frame(Timestamp::from_scale(micros, 1_000_000)?, data)?;
+        Ok(())
     }
     pub fn frame(&mut self, bytes: &[u8], key: bool, timestamp: u64) -> Result<()> {
         let start = *self.start.get_or_insert(timestamp);

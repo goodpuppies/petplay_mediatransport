@@ -27,3 +27,7 @@ encode = ["moq-vaapi"]
 iroh = ["moq-tokio/iroh"]
 # Linux native receiver: VA-API decode, VPP color conversion, and a GBM output pool.
 decode = ["moq-vaapi", "gbm", "iroh"]
+
+# moq-vaapi with H.264 POC type 2 for low-latency hardware decoding; see vendor/moq-vaapi.
+[patch.crates-io]
+moq-vaapi = { path = "vendor/moq-vaapi" }

@@ -406,13 +406,20 @@ async function main() {
       }
     }
   })().catch((error) => stats.errors.push(`Pose track: ${error}`));
-  if (sideBySide && await xrSupported()) {
+  const ar = options.get("xrMode") === "ar";
+  const xrMode = ar ? "immersive-ar" : "immersive-vr";
+  const xrLabel = ar ? "AR" : "VR";
+  const keyHex = options.get("xrKey") ?? "ff00ff";
+  const keyRgb = /^[0-9a-fA-F]{6}$/.test(keyHex) ? parseInt(keyHex, 16) : 0xff00ff;
+  if (sideBySide && await xrSupported(xrMode)) {
     const button = document.createElement("button");
-    button.textContent = "Enter VR";
+    button.textContent = `Enter ${xrLabel}`;
     document.querySelector("header")?.append(button);
     const enter = async (granted?: XRSession) => {
       try {
         endXr = await startXr({
+          mode: xrMode,
+          passthroughKey: [(keyRgb >> 16 & 255) / 255, (keyRgb >> 8 & 255) / 255, (keyRgb & 255) / 255],
           takeFrame: (now) => takeDue(now, true),
           framerate: meta.framerate,
           poseFor: (timestamp) => poses.get(timestamp),
@@ -424,13 +431,13 @@ async function main() {
           onEnd: () => {
             xrActive = false;
             endXr = undefined;
-            button.textContent = "Enter VR";
+            button.textContent = `Enter ${xrLabel}`;
             offer();
           },
         }, granted);
         clearPending();
         xrActive = true;
-        button.textContent = "Exit VR";
+        button.textContent = `Exit ${xrLabel}`;
       } catch (error) {
         stats.errors.push(`XR: ${error}`);
         status.textContent = `XR: ${error}`;
@@ -440,7 +447,7 @@ async function main() {
     // The browser's own "enter VR" prompt, available without finding the page button. The
     // offer is withdrawn when the page button starts a session first.
     const offer = () => {
-      navigator.xr?.offerSession?.("immersive-vr", sessionInit)
+      navigator.xr?.offerSession?.(xrMode, sessionInit)
         .then((session) => endXr ? session.end() : enter(session))
         .catch(() => {});
     };

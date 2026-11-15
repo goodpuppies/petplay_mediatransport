@@ -26,9 +26,22 @@ void main() {
 const fragmentSource = `#version 300 es
 precision mediump float;
 uniform sampler2D picture;
+uniform bool passthrough;
+uniform vec3 keyColor;
 in vec2 uv;
 out vec4 color;
-void main() { color = vec4(texture(picture, uv).rgb, 1.0); }`;
+void main() {
+  vec3 rgb = texture(picture, uv).rgb;
+  if (!passthrough) { color = vec4(rgb, 1.0); return; }
+  // Compare chroma independently of luminance: camera brightness and video range can
+  // change the key's intensity. Feather compression noise and return premultiplied RGBA.
+  vec2 chroma = vec2(dot(rgb, vec3(-0.168736, -0.331264, 0.5)), dot(rgb, vec3(0.5, -0.418688, -0.081312)));
+  vec2 keyChroma = vec2(dot(keyColor, vec3(-0.168736, -0.331264, 0.5)), dot(keyColor, vec3(0.5, -0.418688, -0.081312)));
+  float alpha = smoothstep(0.08, 0.24, distance(chroma, keyChroma));
+  // Remove the key contribution at mixed edges rather than leaving a magenta fringe.
+  vec3 foreground = clamp(rgb - keyColor * (1.0 - alpha), vec3(0.0), vec3(alpha));
+  color = vec4(foreground, alpha);
+}`;
 
 function compile(gl: WebGL2RenderingContext) {
   const shaders: WebGLShader[] = [];
@@ -152,6 +165,9 @@ export function createPresenter(context: XrContext): Presenter {
   const uniform = (name: string) => gl.getUniformLocation(program, name);
   const [tangentsAt, rangeAt, clipAt, pictureAt] = ["tangents", "uRange", "clipFromEye", "picture"]
     .map(uniform);
+  const passthroughAt = uniform("passthrough"), keyAt = uniform("keyColor");
+  const ar = options.mode === "immersive-ar";
+  const key = options.passthroughKey ?? [1, 0, 1];
   let frames = 0, uploads = 0, lastReport = performance.now();
   const velocities = velocityTracker();
   const handVelocities = { left: velocityTracker(), right: velocityTracker() };
@@ -313,7 +329,7 @@ export function createPresenter(context: XrContext): Presenter {
     uplink(xrFrame, viewer, time);
     gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
     gl.disable(gl.DEPTH_TEST);
-    gl.clearColor(0, 0, 0, 1);
+    gl.clearColor(0, 0, 0, ar ? 0 : 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     if (shared.hasPicture) {
       const fov = shared.fov;
@@ -322,6 +338,8 @@ export function createPresenter(context: XrContext): Presenter {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.uniform1i(pictureAt, 0);
+      gl.uniform1i(passthroughAt, ar ? 1 : 0);
+      gl.uniform3f(keyAt, key[0], key[1], key[2]);
       for (const view of viewer.views) {
         const viewport = layer.getViewport(view);
         if (!viewport) continue;

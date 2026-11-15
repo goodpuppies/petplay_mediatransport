@@ -16,9 +16,9 @@ import type {
 } from "./xrTypes";
 export type { SourcePose, XrOptions, XrStats } from "./xrTypes";
 
-export async function xrSupported(): Promise<boolean> {
+export async function xrSupported(mode: "immersive-vr" | "immersive-ar" = "immersive-vr"): Promise<boolean> {
   try {
-    return !!navigator.xr && await navigator.xr.isSessionSupported("immersive-vr");
+    return !!navigator.xr && await navigator.xr.isSessionSupported(mode);
   } catch {
     return false;
   }
@@ -46,14 +46,15 @@ export async function startXr(options: XrOptions, granted?: XRSession): Promise<
   if (!xr) throw Error("WebXR is unavailable");
   const build = await fetchBuild();
   const firstModule = importPresenter(build);
-  const session = granted ?? await xr.requestSession("immersive-vr", sessionInit);
+  const session = granted ?? await xr.requestSession(options.mode ?? "immersive-vr", sessionInit);
+  const ar = options.mode === "immersive-ar";
   const canvas = document.createElement("canvas");
-  const gl = canvas.getContext("webgl2", { xrCompatible: true, alpha: false, antialias: false });
+  const gl = canvas.getContext("webgl2", { xrCompatible: true, alpha: ar, premultipliedAlpha: true, antialias: false });
   if (!gl) {
     await session.end();
     throw Error("WebGL2 is unavailable");
   }
-  const layer = new XRWebGLLayer(session, gl, { antialias: false, depth: false });
+  const layer = new XRWebGLLayer(session, gl, { alpha: ar, antialias: false, depth: false });
   session.updateRenderState({ baseLayer: layer, depthNear: 0.05, depthFar: 100 });
   const space = await session.requestReferenceSpace("local-floor");
   // Display at the source's rate so every picture is shown for exactly one refresh.

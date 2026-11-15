@@ -1,13 +1,13 @@
 // The minimal WebXR Device API surface the viewer uses. TypeScript's DOM library omits WebXR.
 interface XRSystem {
-  isSessionSupported(mode: "immersive-vr"): Promise<boolean>;
+  isSessionSupported(mode: "immersive-vr" | "immersive-ar"): Promise<boolean>;
   requestSession(
-    mode: "immersive-vr",
+    mode: "immersive-vr" | "immersive-ar",
     init?: { requiredFeatures?: string[]; optionalFeatures?: string[] },
   ): Promise<XRSession>;
   /** Lets the browser show its own entry prompt; resolves with the session it starts. */
   offerSession?(
-    mode: "immersive-vr",
+    mode: "immersive-vr" | "immersive-ar",
     init?: { requiredFeatures?: string[]; optionalFeatures?: string[] },
   ): Promise<XRSession>;
 }
@@ -65,7 +65,7 @@ declare class XRWebGLLayer {
   constructor(
     session: XRSession,
     context: WebGL2RenderingContext,
-    init?: { antialias?: boolean; depth?: boolean; framebufferScaleFactor?: number },
+    init?: { alpha?: boolean; antialias?: boolean; depth?: boolean; framebufferScaleFactor?: number },
   );
   readonly framebuffer: WebGLFramebuffer | null;
   readonly framebufferWidth: number;

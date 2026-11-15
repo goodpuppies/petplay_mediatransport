@@ -24,6 +24,9 @@ export type XrStats = {
   velocitySource?: string;
 };
 export type XrOptions = {
+  mode?: "immersive-vr" | "immersive-ar";
+  /** RGB key in 0..1; defaults to magenta in AR. Ignored in VR. */
+  passthroughKey?: [number, number, number];
   /** Picture due for display, if any; the caller transfers ownership. */
   takeFrame(now: number): VideoFrame | undefined;
   /** Head pose the picture with this timestamp was rendered for, if the source sends poses. */

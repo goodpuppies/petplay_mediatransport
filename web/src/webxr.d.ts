@@ -41,6 +41,10 @@ interface XRInputSource {
   readonly gripSpace?: XRSpace;
   readonly gamepad?: Gamepad;
 }
+interface XRInputSourceArray extends Iterable<XRInputSource> {
+  readonly length: number;
+  readonly [index: number]: XRInputSource;
+}
 interface XRFrame {
   readonly session: XRSession;
   getViewerPose(space: XRReferenceSpace): XRViewerPose | undefined;
@@ -64,7 +68,8 @@ declare class XRWebGLLayer {
   getViewport(view: XRView): XRViewport | undefined;
 }
 interface XRSession extends EventTarget {
-  readonly inputSources: ReadonlyArray<XRInputSource>;
+  /** Array-like and iterable, not an Array: no .some()/.map() in real browsers. */
+  readonly inputSources: XRInputSourceArray;
   readonly renderState: { readonly baseLayer?: XRWebGLLayer };
   updateRenderState(state: { baseLayer?: XRWebGLLayer; depthNear?: number; depthFar?: number }): void;
   requestReferenceSpace(type: "local-floor" | "local"): Promise<XRReferenceSpace>;

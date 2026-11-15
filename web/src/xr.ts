@@ -178,6 +178,12 @@ export async function startXr(options: XrOptions): Promise<() => void> {
       head.angularVelocity = point3(viewer.angularVelocity, 40);
     }
     const message: Record<string, unknown> = { version: 1, type: "xr-frame", sequence: ++sequence, head };
+    // Quest Browser never exposes the menu button: both sticks pressed together stand in for
+    // the left menu button (VRChat's menus), and neither stick reports its own click meanwhile.
+    const stickDown = (side: XRHandedness) =>
+      // XRInputSourceArray is array-like only: Quest Browser has no .some() on it.
+      Array.from(session.inputSources).some((s) => s.handedness === side && !!s.gamepad?.buttons[3]?.pressed);
+    const menuChord = stickDown("left") && stickDown("right");
     for (const source of session.inputSources) {
       if (source.handedness === "none" || !source.gripSpace) continue;
       const grip = frame.getPose(source.gripSpace, space);
@@ -193,9 +199,10 @@ export async function startXr(options: XrOptions): Promise<() => void> {
           trigger: unit(b[0]?.value),
           grip: unit(b[1]?.value),
           joystick: [Math.max(-1, Math.min(1, pad.axes[2] ?? 0)), Math.max(-1, Math.min(1, -(pad.axes[3] ?? 0)))],
-          joystickClick: !!b[3]?.pressed,
+          joystickClick: !menuChord && !!b[3]?.pressed,
           a: !!b[4]?.pressed,
           b: !!b[5]?.pressed,
+          system: menuChord && source.handedness === "left",
         };
       }
       message[source.handedness] = hand;

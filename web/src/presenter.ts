@@ -107,7 +107,7 @@ const normalize = (q: Quat): Quat => {
 function velocityTracker() {
   let last: { time: number; position: Vec3; rotation: Quat } | undefined;
   let linear: Vec3 = [0, 0, 0], angular: Vec3 = [0, 0, 0];
-  return (time: number, viewer: XRViewerPose) => {
+  return (time: number, viewer: XRPose) => {
     const position = [viewer.transform.position.x, viewer.transform.position.y, viewer.transform.position.z] as Vec3;
     const rotation = quat(viewer.transform.orientation);
     const dt = last ? (time - last.time) / 1000 : 0;
@@ -154,6 +154,17 @@ export function createPresenter(context: XrContext): Presenter {
     .map(uniform);
   let frames = 0, uploads = 0, lastReport = performance.now();
   const velocities = velocityTracker();
+  const handVelocities = { left: velocityTracker(), right: velocityTracker() };
+  /** `pose` moved forward by `seconds` along its velocities, as sent to the driver. */
+  const predict = (pose: XRPose, velocity: ReturnType<ReturnType<typeof velocityTracker>>, seconds: number) => {
+    const p = pose.transform.position;
+    return {
+      position: [p.x, p.y, p.z].map((v, i) =>
+        Math.max(-100, Math.min(100, v + velocity.linear[i] * seconds))
+      ) as Vec3,
+      rotation: normalize(quatMul(spin(velocity.angular, seconds), quat(pose.transform.orientation))),
+    };
+  };
 
   function uplink(frame: XRFrame, viewer: XRViewerPose, time: number) {
     if (!shared.viewsSent && shared.bridgeReady && viewer.views.length === 2) {
@@ -193,11 +204,7 @@ export function createPresenter(context: XrContext): Presenter {
       stats.predictMs = ahead * 1000;
       stats.velocitySource = velocity.source;
     }
-    const p = viewer.transform.position;
-    const head: Record<string, unknown> = {
-      position: [p.x, p.y, p.z].map((v, i) => Math.max(-100, Math.min(100, v + velocity.linear[i] * ahead))),
-      rotation: normalize(quatMul(spin(velocity.angular, ahead), quat(viewer.transform.orientation))),
-    };
+    const head: Record<string, unknown> = predict(viewer, velocity, ahead);
     head.velocity = velocity.linear.map((v) => Math.max(-20, Math.min(20, v)));
     if (options.angularVelocity && viewer.angularVelocity) {
       head.angularVelocity = point3(viewer.angularVelocity, 40);
@@ -206,6 +213,8 @@ export function createPresenter(context: XrContext): Presenter {
       version: 1,
       type: "xr-frame",
       sequence: ++shared.sequence,
+      // Lets the driver map this frame onto its own clock and latch the hands at a steady lag.
+      time,
       head,
     };
     // XRInputSourceArray is array-like only: Quest Browser has no .some() on it.
@@ -220,9 +229,22 @@ export function createPresenter(context: XrContext): Presenter {
       const grip = frame.getPose(source.gripSpace, space);
       const hand: Record<string, unknown> = {};
       if (grip) {
+        // Controllers are predicted by the same horizon as the head, so hands and head in a
+        // frame match where they will be when it is shown.
+        const handVelocity = handVelocities[source.handedness](time, grip);
+        if (traceRow && source.handedness === "right") {
+          const g = grip.transform.position;
+          traceRow.raw = [g.x, g.y, g.z].map((v) => +v.toFixed(5));
+          traceRow.vs = handVelocity.source;
+          traceRow.vel = handVelocity.linear.map((v) => +v.toFixed(4));
+          traceRow.ahead = +(ahead * 1000).toFixed(1);
+          traceRow.sent = shared.sequence;
+        }
         hand.pose = {
-          position: point3(grip.transform.position, 100),
-          rotation: quat(grip.transform.orientation),
+          ...predict(grip, handVelocity, ahead),
+          // The driver carries the pose along these to each display frame's moment.
+          velocity: handVelocity.linear.map((v) => Math.max(-20, Math.min(20, v))),
+          angularVelocity: handVelocity.angular.map((v) => Math.max(-40, Math.min(40, v))),
         };
       }
       // xr-standard mapping: 0 trigger, 1 squeeze, 3 stick press, 4 A/X, 5 B/Y; axes 2/3 stick.
@@ -247,9 +269,28 @@ export function createPresenter(context: XrContext): Presenter {
     send(message);
   }
 
+  /** Opt-in per-frame trace for pacing analysis: set `petplayStream.handTrace = []`. */
+  const trace = () => (stats as { handTrace?: unknown[] } | undefined)?.handTrace;
+  let traceRow: Record<string, unknown> | undefined;
   function frame(time: number, xrFrame: XRFrame) {
     const viewer = xrFrame.getViewerPose(space);
     const picture = options.takeFrame(time);
+    const rows = trace();
+    const callbackStart = performance.now();
+    traceRow = rows
+      ? { t: +time.toFixed(2), pic: picture ? picture.timestamp : null, start: +callbackStart.toFixed(2) }
+      : undefined;
+    if (traceRow && picture) {
+      const times = (globalThis as { petplayPictureTimes?: Record<string, Map<number, number>> })
+        .petplayPictureTimes;
+      traceRow.arr = times?.arrivedAt.get(picture.timestamp);
+      traceRow.dec = times?.decodedAt.get(picture.timestamp);
+      traceRow.now = +performance.now().toFixed(2);
+    }
+    if (rows && traceRow) {
+      rows.push(traceRow);
+      if (rows.length > 4000) rows.shift();
+    }
     if (picture) {
       try {
         gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -258,6 +299,7 @@ export function createPresenter(context: XrContext): Presenter {
         uploads++;
         const pose = options.poseFor?.(picture.timestamp);
         shared.shownPose = pose;
+        if (traceRow) traceRow.seq = pose?.sequence;
         if (pose) {
           if (stats) stats.posed++;
           const sent = shared.sentAt.get(pose.sequence);
@@ -312,6 +354,10 @@ export function createPresenter(context: XrContext): Presenter {
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       }
       gl.bindVertexArray(null);
+    }
+    if (traceRow) {
+      // Main-thread time spent in this XR callback (upload, uplink, draw submission).
+      traceRow.cb = +(performance.now() - (traceRow.start as number)).toFixed(2);
     }
     frames++;
     if (time - lastReport > 1000) {

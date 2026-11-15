@@ -77,7 +77,16 @@ const stats = {
     presenterErrors: [],
   } as XrStats,
   poseAgeUs: [] as number[],
-  /** Decoded pictures XR lets wait behind the one shown (0–3). */
+  /**
+   * XR picture pacing. "queue" (default) keeps at most `xrQueue` decoded pictures waiting and
+   * drops the rest at once. "steady" shows the next picture in order every display frame and
+   * drops one only after being a picture behind for `xrCatchUpFrames` frames in a row; it
+   * smooths decode-deadline races but adds latency while the sender delivers in bursts.
+   */
+  xrPacing: new URLSearchParams(location.search).get("xrPacing") ?? "queue",
+  xrCatchUpFrames: 36,
+  xrCatchUps: 0,
+  /** Decoded pictures XR lets wait behind the one shown (0–3), with `xrPacing=queue`. */
   xrQueue: Number(new URLSearchParams(location.search).get("xrQueue") ?? 1),
   xrWaiting: [] as number[],
   /** Browser-side latency of each picture shown in XR, in milliseconds. */
@@ -86,6 +95,9 @@ const stats = {
 };
 // When each picture (by timestamp) arrived and finished decoding, for the XR breakdown.
 const arrivedAt = new Map<number, number>(), decodedAt = new Map<number, number>();
+// Per-picture receive and decode times (performance.now ms by picture timestamp), for pacing
+// analysis from DevTools.
+(window as any).petplayPictureTimes = { arrivedAt, decodedAt };
 const remember = (map: Map<number, number>, key: number, value: number) => {
   map.set(key, value);
   if (map.size > 120) map.delete(map.keys().next().value!);
@@ -103,7 +115,10 @@ async function main() {
   const config = await (await fetch("/config.json")).json();
   const origin = new Moq.Origin.Producer();
   const url = new URL(config.url);
-  url.hostname = location.hostname;
+  // `?media=HOST` sends the media connection somewhere other than the page's host, such as
+  // the source's LAN address while the page itself comes through a tailnet HTTPS proxy. The
+  // certificate is pinned by hash, so an IP literal works.
+  url.hostname = new URLSearchParams(location.search).get("media") ?? location.hostname;
   const connection = await Moq.Connection.connect({
     url,
     consume: origin,
@@ -211,12 +226,16 @@ async function main() {
   }
   // While a WebXR session runs, its frame loop takes pictures instead of the page canvas.
   let xrActive = false;
+  /** Consecutive XR frames with at least one more decoded picture waiting. */
+  let behindFrames = 0;
   /**
    * The picture to show now. The page canvas jumps to the newest due picture on a buffered
-   * clock. XR ignores that buffer: it shows the oldest decoded picture, one per display frame,
-   * and drops older ones so that at most `stats.xrQueue` wait behind it. In order, a source at
-   * the headset's rate shows every picture once; a queue that never drains would otherwise
-   * add whole frames of latency. Timewarp hides the rare repeated picture.
+   * clock. XR ignores that buffer and shows decoded pictures in order, one per display frame
+   * (see `stats.xrPacing`). Always jumping to the newest made moving things judder: the next
+   * picture often finishes decoding right at the display deadline, so it alternately made it
+   * (a skip) and then left the next frame empty (a repeat). Steady pacing instead only catches
+   * up after being behind for a while, which a source slightly faster than the headset (PC
+   * 72.00 Hz, Quest ~71.83 Hz) needs about once every six seconds.
    */
   function takeDue(now: number, inOrder = false): VideoFrame | undefined {
     stats.clock = {
@@ -228,11 +247,23 @@ async function main() {
     };
     let ready: VideoFrame | undefined;
     if (inOrder) {
-      // Live-tunable from DevTools: window.petplayStream.xrQueue.
-      const keep = Math.max(0, Math.min(3, Math.floor(stats.xrQueue)));
-      while (pending.length > keep + 1) {
-        pending.shift()!.close();
-        stats.presentationDropped++;
+      // Live-tunable from DevTools: window.petplayStream.xrPacing / xrCatchUpFrames / xrQueue.
+      if (stats.xrPacing === "steady") {
+        behindFrames = pending.length >= 2 ? behindFrames + 1 : 0;
+        const limit = Math.max(1, Math.floor(stats.xrCatchUpFrames));
+        // A stall that left several pictures waiting is cleared at once.
+        while (pending.length > 3 || (behindFrames >= limit && pending.length >= 2)) {
+          pending.shift()!.close();
+          stats.presentationDropped++;
+          stats.xrCatchUps++;
+          behindFrames = 0;
+        }
+      } else {
+        const keep = Math.max(0, Math.min(3, Math.floor(stats.xrQueue)));
+        while (pending.length > keep + 1) {
+          pending.shift()!.close();
+          stats.presentationDropped++;
+        }
       }
       ready = pending.shift();
       sample(stats.xrWaiting, pending.length);

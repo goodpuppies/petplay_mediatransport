@@ -198,6 +198,13 @@ pub fn serve(
     listen.tls.generate = vec!["localhost".into(), "127.0.0.1".into()];
     let mut config = moq_tokio::server::Config::default();
     config.listen = listen;
+    // moq's own setting name (`loss` = CUBIC, `delay` = BBRv3, the default). Configs built in
+    // code do not read the environment by themselves.
+    if let Ok(family) = std::env::var("MOQ_QUIC_CONGESTION_CONTROL") {
+        config.quic.congestion_control =
+            Some(family.parse().map_err(|e: String| anyhow::anyhow!(e))?);
+        println!("QUIC_CONGESTION_CONTROL {family}");
+    }
     let mut share_code = None;
     if transport != Transport::Browser {
         #[cfg(feature = "iroh")]

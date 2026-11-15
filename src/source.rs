@@ -155,7 +155,7 @@ pub use pose_ring::Pose;
 pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let usage = "usage: petplay-media SOCKET OUTPUT.h264 [QUIC_LISTEN_ADDR] \
         [--iroh-local|--iroh-share] [--fps N] [--bitrate BITS_PER_SECOND] \
-        [--layout mono|side-by-side] [--pose-ring PATH] [--pose-lag-us N]";
+        [--layout mono|side-by-side] [--pose-ring PATH] [--pose-lag-us N] [--keyframe-seconds N]";
     let mut positional: Vec<&std::ffi::OsStr> = Vec::new();
     let mut transport = publish::Transport::Browser;
     let mut framerate = 75u32;
@@ -165,6 +165,8 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     // tick, so a frame's pose is the newest latched at capture (minus an optional lag).
     let mut pose_path: Option<std::path::PathBuf> = None;
     let mut pose_lag_us = 0u64;
+    // A keyframe costs an encode spike and a burst of bytes; late joiners wait up to this long.
+    let mut keyframe_seconds = 1u32;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         let text = arg.to_str().context("non-UTF-8 argument")?;
@@ -178,6 +180,15 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             } else {
                 publish::Transport::Peer
             };
+        } else if text == "--keyframe-seconds" {
+            keyframe_seconds = rest
+                .next()
+                .context("--keyframe-seconds needs a value")?
+                .to_str()
+                .context("non-UTF-8 option value")?
+                .parse()
+                .context("--keyframe-seconds")?;
+            ensure!((1..=60).contains(&keyframe_seconds), "--keyframe-seconds out of range");
         } else if matches!(text, "--pose-ring" | "--pose-lag-us") {
             let value = rest
                 .next()
@@ -211,6 +222,12 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     ensure!(
         (1..=240).contains(&framerate) && (100_000..=200_000_000).contains(&bitrate),
         "framerate or bitrate out of range"
+    );
+    // Each keyframe starts a MoQ group, and moq-net aborts a group past 32 MB of cached frames.
+    // Keep a group within 3/4 of that so VBR peaks and keyframes fit.
+    ensure!(
+        u64::from(bitrate) / 8 * u64::from(keyframe_seconds) <= 24 * 1024 * 1024,
+        "--keyframe-seconds {keyframe_seconds} at {bitrate} bit/s exceeds the 32 MB MoQ group limit"
     );
     let socket = Path::new(positional[0]);
     let output_path = Path::new(positional[1]);
@@ -251,6 +268,10 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let mut output = recording.then(|| File::create(output_path)).transpose()?;
     let mut journal = recording
         .then(|| File::create(output_path.with_extension("frames.jsonl")))
+        .transpose()?;
+    // PETPLAY_FRAME_TRACE=PATH: one line per published frame, for pacing analysis.
+    let mut frame_trace = std::env::var_os("PETPLAY_FRAME_TRACE")
+        .map(|path| File::create(path).map(std::io::LineWriter::new))
         .transpose()?;
     let mut encoder: Option<Encoder> = None;
     let mut geometry = None;
@@ -298,7 +319,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         }
         let image = fds.pop().unwrap();
         if encoder.is_none() {
-            let mut cfg = Config::new(width, height, framerate, bitrate, framerate);
+            let mut cfg = Config::new(width, height, framerate, bitrate, framerate * keyframe_seconds);
             cfg.device = Some("/dev/dri/renderD128".into());
             encoder = Some(Encoder::new(cfg).context("hardware H.264 encoder")?);
             geometry = Some((width, height));
@@ -319,7 +340,8 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             "stream resize requires a new session"
         );
         let start = Instant::now();
-        let key = frames % u64::from(framerate) == 0;
+        let picked_up = monotonic();
+        let key = frames % u64::from(framerate * keyframe_seconds) == 0;
         let buffer = DmaBuf {
             drm_format: drm::ARGB8888,
             modifier,
@@ -335,8 +357,20 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             .encode_dmabuf(buffer, key)
             .context("strict GPU DMA-BUF encode")?;
         ensure!(!encoded.is_empty(), "empty encoded frame");
+        let encoded_at = monotonic();
         if let Some(publisher) = publisher.as_mut() {
             publisher.frame(&encoded, key, timestamp)?;
+            if let Some(trace) = frame_trace.as_mut() {
+                // Capture time and µs after it: picked up, encoded, handed to MoQ.
+                writeln!(
+                    trace,
+                    "{timestamp} {} {} {} {} {key}",
+                    picked_up.saturating_sub(timestamp) / 1000,
+                    encoded_at.saturating_sub(timestamp) / 1000,
+                    monotonic().saturating_sub(timestamp) / 1000,
+                    encoded.len(),
+                )?;
+            }
             // The driver creates the ring when SteamVR starts, usually after this worker.
             if let Some(path) = pose_path.as_ref().filter(|_| pose_ring.is_none()) {
                 if pose_retry.elapsed() > Duration::from_secs(1) || frames == 0 {

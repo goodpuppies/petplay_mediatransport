@@ -25,8 +25,14 @@ default = ["encode"]
 # (the `gateway` subcommand) drops them, which is what a non-Linux receiver needs.
 encode = ["moq-vaapi"]
 iroh = ["moq-tokio/iroh"]
+# Already encoded input can publish without linking a platform encoder.
+publish = []
+decode-windows = ["publish", "windows", "iroh"]
 # Linux native receiver: VA-API decode, VPP color conversion, and a GBM output pool.
 decode = ["moq-vaapi", "gbm", "iroh"]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", optional = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_Media_MediaFoundation", "Win32_Graphics_Gdi", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 
 # moq-vaapi with H.264 POC type 2 for low-latency hardware decoding; see vendor/moq-vaapi.
 [patch.crates-io]

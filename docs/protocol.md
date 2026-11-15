@@ -89,3 +89,31 @@ Only version-1 mono Annex-B H.264 catalogs are accepted. Catalog and decoded dim
 agree; resizing requires a fresh session. Consumer disconnect closes the receiver and removes
 its socket, including when initialization fails after binding. Network errors terminate the
 session rather than reconnecting silently.
+
+
+## Windows native receiver output
+
+`receive SHARE_CODE --stdio` emits newline-delimited `WINDOWS_MEDIA_FRAME ` followed by JSON:
+
+```json
+{"version":1,"handle":"1073742786","width":640,"height":480,"sequence":1,"timestampUs":0}
+```
+
+Other stdout lines are diagnostics; stderr carries failures. The decimal-string handle is a
+legacy DXGI shared handle from `IDXGIResource::GetSharedHandle`, not an NT handle to duplicate
+or close. It identifies one persistent BGRA8 texture owned by the receiver. The handle and
+geometry are fixed for the session, including decoder reference resets. There are no CPU
+pixel payloads or frame FDs. The consumer must use the same GPU adapter and hold a local pipe
+connection to the native owner. There is no media authentication on this local metadata pipe;
+PetPlay owns both endpoints via its child process.
+
+The private conversion texture is updated by `VideoProcessorBlt`; only atomic `CopyResource`
+updates touch the shared presentation texture, following OpenVR's DXGISharedHandle contract.
+A GPU event query completes before the frame record is written. The consumer can drop stale
+metadata and present the newest frame, since the texture always contains the newest completed
+copy (or a later atomic update). No per-frame ACK is required for this persistent storage.
+
+Send the exact line `STOP` on stdin or close stdin to stop. The owner retains the texture until
+shutdown. PetPlay clears/destroys its OpenVR overlay before sending STOP. Failure, network
+termination or forced process exit ends the session; consumers must clear their presentation
+reference and start a new session rather than reuse the old numeric handle.

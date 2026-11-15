@@ -1,13 +1,13 @@
 //! Small MoQ broadcast: config JSON and timestamped Annex-B access units.
 use anyhow::{Context, Result};
 use moq_net::origin;
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 use moq_net::{Timescale, Timestamp, broadcast, group, track};
 use std::net::SocketAddr;
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 use std::time::Duration;
 /// How one encoded picture carries the source's views.
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// One view filling the picture, such as a desktop or a single camera.
@@ -15,7 +15,7 @@ pub enum Layout {
     /// Two views of equal width, left then right.
     SideBySide,
 }
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 impl Layout {
     pub fn parse(text: &str) -> Result<Self> {
         match text {
@@ -32,7 +32,7 @@ impl Layout {
     }
 }
 /// The source geometry a receiver needs before the first access unit.
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 #[derive(Clone, Copy, Debug)]
 pub struct Format {
     pub width: u32,
@@ -55,7 +55,7 @@ pub enum Transport {
     /// code. Relays carry holepunch coordination; a viewer refuses a relayed media path.
     Peer,
 }
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 pub struct Publisher {
     pub fingerprint: String,
     _runtime: tokio::runtime::Runtime,
@@ -71,7 +71,7 @@ pub struct Publisher {
     pose: track::Producer,
     pose_group: Option<(u64, group::Producer)>,
 }
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 impl Publisher {
     pub fn new(bind: SocketAddr, transport: Transport) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -253,7 +253,7 @@ pub async fn local_endpoint() -> Result<moq_tokio::iroh::Endpoint> {
         .bind()
         .await?)
 }
-#[cfg(feature = "encode")]
+#[cfg(any(feature = "encode", feature = "publish"))]
 fn codec(data: &[u8]) -> Option<String> {
     for i in 0..data.len() {
         let p = if data[i..].starts_with(&[0, 0, 0, 1]) {

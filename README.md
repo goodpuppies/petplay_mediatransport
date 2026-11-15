@@ -8,7 +8,7 @@ and compositor behavior belongs to `petplay_ovrdriver`; media transport belongs 
 
 ## Current implementation
 
-This is an early Linux video prototype, not yet a cross-platform media framework:
+This is an early video prototype with Linux encoding and Linux/Windows native reception:
 
 - Import Vulkan DMA-BUF frames and synchronization FDs from a Unix seqpacket socket.
 - Convert RGB to NV12 and encode H.264 with VAAPI, without a CPU raw-frame fallback.
@@ -16,7 +16,8 @@ This is an early Linux video prototype, not yet a cross-platform media framework
   Iroh endpoint announced as a share code.
 - Relay MoQ tracks from Iroh to browser WebTransport without decoding or re-encoding.
 - Receive and decode in a WebCodecs browser viewer, with timestamp-based presentation.
-- Decode a mono H.264 subscription on Linux VA-API and export synchronized RGB DMA-BUF slots.
+- Decode mono H.264 on Linux VA-API into RGB DMA-BUF slots, or on Windows Media Foundation
+  into a persistent shared D3D11 RGB texture.
 - Optionally record encoded H.264 and a frame journal.
 
 The feed's geometry comes from the producer's first frame descriptor; `--fps`, `--bitrate` and
@@ -149,8 +150,33 @@ The consumer must honor [the output ACK contract](docs/protocol.md#native-receiv
 PetPlay's `remoteMediaOverlay` actor supplies that consumer and an EGL-backed GL texture for
 OpenVR. It performs a GPU copy into presentation-owned storage before ACKing a slot. This is
 zero CPU raw-frame transfer, with GPU color conversion and a presentation copy. It is not a
-copy-free path. Windows native reception remains unimplemented; its browser gateway still
-builds independently of VA-API.
+copy-free path. The Windows receiver uses Media Foundation and D3D11 instead, and builds independently of VA-API.
+
+## Native Windows GPU receiver
+
+```sh
+cargo build --release --no-default-features --features decode-windows
+target/release/petplay-media.exe receive SHARE_CODE --stdio
+```
+
+The inbox H.264 MFT receives a D3D11 device manager. CPU-backed output is rejected: decoded
+samples must expose NV12 hardware decoder surfaces. D3D11 video processing converts to private
+BGRA storage, then an atomic `CopyResource` updates one persistent legacy-shared BGRA texture.
+The event query completes before a `WINDOWS_MEDIA_FRAME` JSON line publishes the handle and
+geometry. Deno/OpenVR can use that handle without GL interop or receiving raw pixels.
+
+Set `PETPLAY_DXGI_ADAPTER` to a DXGI adapter index to match the consumer; otherwise the default
+hardware adapter is used. PetPlay's Windows actor selects SteamVR's adapter automatically. The
+local consumer must be on the same adapter. It sends `STOP\n` on stdin, or closes stdin, to
+stop; clear the overlay's texture reference before releasing the native owner.
+
+Windows hardware decoding, cross-process shared-image access, and Linux-to-Windows Iroh
+reception have been validated with synthetic imagery. Windows OpenVR submission still needs a
+headset target. `decode-test FIXTURE WIDTH HEIGHT [DIAGNOSTIC.bgra] [--hold] [--reset-test]` accepts a finite
+fixture of u32 little-endian lengths followed by Annex-B access units. `shared-test HANDLE
+WIDTH HEIGHT DIAGNOSTIC.bgra` checks a second process can read the shared image. Only these
+explicit diagnostic commands download pixels; normal reception does not. `--reset-test` replays
+the fixture after flushing references and checks that the shared handle stays unchanged.
 
 ## Viewer diagnostics
 
@@ -172,7 +198,10 @@ necessarily skips some source frames.
 ## Layout and next boundaries
 
 - `src/source.rs`: Linux DMA-BUF ingestion, synchronization, VAAPI encoding, recording, ACKs.
-- `src/receive.rs`: native MoQ subscription, bounded decode queue, and VA-API decoding.
+- `src/receive_input.rs`: native MoQ subscription and bounded encoded-input queue.
+- `src/receive.rs`: Linux VA-API decode loop.
+- `src/windows_decode.rs`: Windows Media Foundation and D3D11 GPU decoding/conversion.
+- `src/windows_receive.rs`: Windows native receive loop and local handle metadata.
 - `src/receive_output.rs`: GPU color conversion, GBM slots, descriptor transfer, exact ACKs.
 - `src/publish.rs`: custom MoQ tracks and native transport endpoints.
 - `src/peer.rs`: share codes, the peer endpoint, and the direct-path requirement.
@@ -215,3 +244,23 @@ and stereo (`?view=left` or `?view=stereo` set the initial choice). This crops t
 side-by-side decoded feed; the native stream remains stereo. Pointer coordinates are mapped
 back into the selected source eye before sending, including during captured drags. Canvas
 aspect ratio is preserved on narrow screens so CSS scaling does not offset picking.
+
+
+## Existing Rust desktop capture on Windows
+
+A `publish` feature enables already-encoded ingress independently of a platform encoder.
+`publish-annexb WIDTH HEIGHT FPS` reads AUD-delimited Annex-B H.264 on stdin and publishes
+mono tracks through a share-code endpoint. It does not decode or re-encode that input.
+
+On Windows, `capture-tcp PORT FFMPEG_EXE FPS` accepts the existing `screen-streamer` BGRA
+chunk protocol on **localhost only**, starts one NVENC encoder child, and publishes its encoded
+output. Start `screen-streamer.exe --port=PORT --fps=30 --single-monitor --no-input` after
+`CAPTURE_LISTEN` appears. Capture geometry is fixed for the connection. The encoder scales to
+1280×720 while preserving aspect ratio. This adapter deliberately uses the existing CPU BGRA
+capture path; it is not an all-GPU capture adapter. No raw pixels traverse Iroh.
+
+Use an FFmpeg build compatible with the installed NVIDIA driver. The PetPlay prototype uses
+portable 8.0.1 because the machine's NVENC API 13.0 driver cannot load the installed 8.1.2
+encoder's required API 13.1. No FFmpeg capture filters or chained FFmpeg processes are needed.
+The native publisher exits when capture/encoding ends. The caller owns the lifetime of the
+capturer and encoder and must stop its process tree during teardown.

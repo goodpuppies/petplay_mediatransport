@@ -406,19 +406,34 @@ async function main() {
       }
     }
   })().catch((error) => stats.errors.push(`Pose track: ${error}`));
-  const ar = options.get("xrMode") === "ar";
-  const xrMode = ar ? "immersive-ar" : "immersive-vr";
-  const xrLabel = ar ? "AR" : "VR";
   const keyHex = options.get("xrKey") ?? "ff00ff";
   const keyRgb = /^[0-9a-fA-F]{6}$/.test(keyHex) ? parseInt(keyHex, 16) : 0xff00ff;
-  if (sideBySide && await xrSupported(xrMode)) {
-    const button = document.createElement("button");
-    button.textContent = `Enter ${xrLabel}`;
-    document.querySelector("header")?.append(button);
-    const enter = async (granted?: XRSession) => {
+  if (sideBySide) {
+    const modes = ["immersive-vr", "immersive-ar"] as const;
+    type Mode = typeof modes[number];
+    const support = await Promise.all(modes.map((mode) => xrSupported(mode)));
+    const buttons = new Map<Mode, HTMLButtonElement>();
+    let activeMode: Mode | null = null;
+    let starting = false;
+    const label = (mode: Mode) => mode === "immersive-ar" ? "AR" : "VR";
+    const updateButtons = () => {
+      for (const [mode, button] of buttons) {
+        button.textContent = `${activeMode === mode ? "Exit" : "Enter"} ${label(mode)}`;
+        button.disabled = starting || (activeMode !== null && activeMode !== mode);
+        button.title = activeMode !== null && activeMode !== mode
+          ? `Exit ${label(activeMode)} first` : "";
+      }
+    };
+    const enter = async (mode: Mode, granted?: XRSession) => {
+      if (activeMode !== null || starting) {
+        await granted?.end();
+        return;
+      }
+      starting = true;
+      updateButtons();
       try {
         endXr = await startXr({
-          mode: xrMode,
+          mode,
           passthroughKey: [(keyRgb >> 16 & 255) / 255, (keyRgb >> 8 & 255) / 255, (keyRgb & 255) / 255],
           takeFrame: (now) => takeDue(now, true),
           framerate: meta.framerate,
@@ -430,28 +445,44 @@ async function main() {
           status: (text) => status.textContent = text,
           onEnd: () => {
             xrActive = false;
+            activeMode = null;
             endXr = undefined;
-            button.textContent = `Enter ${xrLabel}`;
-            offer();
+            starting = false;
+            updateButtons();
           },
         }, granted);
         clearPending();
         xrActive = true;
-        button.textContent = `Exit ${xrLabel}`;
+        activeMode = mode;
+        starting = false;
+        updateButtons();
       } catch (error) {
+        starting = false;
+        updateButtons();
         stats.errors.push(`XR: ${error}`);
         status.textContent = `XR: ${error}`;
-        offer();
       }
     };
-    // The browser's own "enter VR" prompt, available without finding the page button. The
-    // offer is withdrawn when the page button starts a session first.
+    // Offer once on page load; exiting returns to both page buttons without re-entering.
+    // xrMode selects the preferred prompt; both supported modes have page buttons.
+    const preferred: Mode = options.get("xrMode") === "ar" ? "immersive-ar" : "immersive-vr";
     const offer = () => {
-      navigator.xr?.offerSession?.(xrMode, sessionInit)
-        .then((session) => endXr ? session.end() : enter(session))
+      if (!buttons.has(preferred) || activeMode !== null || starting) return;
+      navigator.xr?.offerSession?.(preferred, sessionInit)
+        .then((session) => enter(preferred, session))
         .catch(() => {});
     };
-    button.onclick = () => endXr ? endXr() : enter();
+    for (const [index, mode] of modes.entries()) {
+      if (!support[index]) continue;
+      const button = document.createElement("button");
+      buttons.set(mode, button);
+      button.onclick = () => {
+        if (activeMode === mode) endXr?.();
+        else void enter(mode);
+      };
+      document.querySelector("header")?.append(button);
+    }
+    updateButtons();
     offer();
   }
   const video = active.track("video").subscribe();

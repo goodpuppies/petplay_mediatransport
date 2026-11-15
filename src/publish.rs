@@ -74,8 +74,12 @@ pub struct Publisher {
 #[cfg(any(feature = "encode", feature = "publish"))]
 impl Publisher {
     pub fn new(bind: SocketAddr, transport: Transport) -> Result<Self> {
+        let threads = std::env::var("PETPLAY_PUBLISH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(threads)
             .enable_all()
             .build()?;
         let _enter = runtime.enter();
@@ -204,6 +208,11 @@ pub fn serve(
         config.quic.congestion_control =
             Some(family.parse().map_err(|e: String| anyhow::anyhow!(e))?);
         println!("QUIC_CONGESTION_CONTROL {family}");
+    }
+    // One qlog file per connection into this existing directory (needs the `qlog` feature).
+    if let Some(dir) = std::env::var_os("MOQ_QUIC_QLOG") {
+        config.quic.qlog = Some(dir.into());
+        println!("QUIC_QLOG enabled");
     }
     let mut share_code = None;
     if transport != Transport::Browser {

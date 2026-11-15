@@ -25,6 +25,8 @@ default = ["encode"]
 # (the `gateway` subcommand) drops them, which is what a non-Linux receiver needs.
 encode = ["moq-vaapi"]
 iroh = ["moq-tokio/iroh"]
+# QUIC qlog traces (MOQ_QUIC_QLOG=DIR), for transport timing analysis.
+qlog = ["moq-tokio/qlog"]
 # Already encoded input can publish without linking a platform encoder.
 publish = []
 decode-windows = ["publish", "windows", "iroh"]

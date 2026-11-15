@@ -78,12 +78,13 @@ const stats = {
   } as XrStats,
   poseAgeUs: [] as number[],
   /**
-   * XR picture pacing. "queue" (default) keeps at most `xrQueue` decoded pictures waiting and
-   * drops the rest at once. "steady" shows the next picture in order every display frame and
-   * drops one only after being a picture behind for `xrCatchUpFrames` frames in a row; it
-   * smooths decode-deadline races but adds latency while the sender delivers in bursts.
+   * XR picture pacing. "steady" (default) shows the next picture in order every display frame
+   * and drops one only after being a picture behind for `xrCatchUpFrames` frames in a row.
+   * "queue" keeps at most `xrQueue` decoded pictures waiting and drops the rest at once; with
+   * evenly arriving pictures it skips and repeats whenever decoding ends near the deadline
+   * (42% of frames measured at 3360×1760, against 1.5% steady).
    */
-  xrPacing: new URLSearchParams(location.search).get("xrPacing") ?? "queue",
+  xrPacing: new URLSearchParams(location.search).get("xrPacing") ?? "steady",
   xrCatchUpFrames: 36,
   xrCatchUps: 0,
   /** Decoded pictures XR lets wait behind the one shown (0–3), with `xrPacing=queue`. */

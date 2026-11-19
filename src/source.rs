@@ -49,6 +49,26 @@ impl Drop for SocketPath {
         }
     }
 }
+/// Returns a slot to the producer: its reuse permission for this exact slot and sequence.
+fn release(client: &OwnedFd, slot: usize, seq: u64) -> std::io::Result<()> {
+    let mut ack = [0u8; 16];
+    ack[..4].copy_from_slice(&MAGIC.to_le_bytes());
+    ack[4..8].copy_from_slice(&(slot as u32).to_le_bytes());
+    ack[8..].copy_from_slice(&seq.to_le_bytes());
+    let n = unsafe {
+        libc::send(
+            client.as_raw_fd(),
+            ack.as_ptr().cast(),
+            ack.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    if n != ack.len() as isize {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn listen(path: &Path) -> Result<(OwnedFd, SocketPath)> {
     use std::os::unix::ffi::OsStrExt;
     let bytes = path.as_os_str().as_bytes();
@@ -156,7 +176,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let usage = "usage: petplay-media SOCKET OUTPUT.h264 [QUIC_LISTEN_ADDR] \
         [--iroh-local|--iroh-share] [--fps N] [--bitrate BITS_PER_SECOND] \
         [--layout mono|side-by-side] [--pose-ring PATH] [--pose-lag-us N] [--keyframe-seconds N] \
-        [--persist]";
+        [--persist] [--max-fps N]";
     let mut positional: Vec<&std::ffi::OsStr> = Vec::new();
     let mut transport = publish::Transport::Browser;
     let mut framerate = 75u32;
@@ -172,11 +192,23 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     // encoder and broadcast. For long-lived feeds whose capture restarts (a desktop capture
     // helper); without it the worker ends with its first producer.
     let mut persist = false;
+    // Encode at most this many frames a second, whatever the producer sends.
+    let mut max_fps: Option<u32> = None;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         let text = arg.to_str().context("non-UTF-8 argument")?;
         if text == "--persist" {
             persist = true;
+        } else if text == "--max-fps" {
+            let value: u32 = rest
+                .next()
+                .context("--max-fps needs a value")?
+                .to_str()
+                .context("non-UTF-8 option value")?
+                .parse()
+                .context("--max-fps")?;
+            ensure!((1..=240).contains(&value), "--max-fps out of range");
+            max_fps = Some(value);
         } else if matches!(text, "--iroh-local" | "--iroh-share") {
             ensure!(
                 transport == publish::Transport::Browser,
@@ -272,6 +304,9 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let mut encoder: Option<Encoder> = None;
     let mut geometry = None;
     let mut last: [u64; 3];
+    let min_interval = max_fps.map(|fps| Duration::from_secs_f64(0.75 / f64::from(fps)));
+    let mut last_encoded: Option<Instant> = None;
+    let mut skipped = 0u64;
     let mut frames = 0u64;
     let mut position = 0u64;
     let mut pose_ring: Option<pose_ring::PoseRing> = None;
@@ -334,6 +369,25 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
                     && format == 44,
                 "unsupported frame descriptor or sequence"
             );
+            // --max-fps: a producer faster than the cap has the extra frames released unread
+            // (no fence wait, no encode). The 3/4 margin lets a source at the cap through its
+            // jitter, while a much faster one is held to about the cap.
+            if let Some(interval) = min_interval {
+                let now = Instant::now();
+                if last_encoded.is_some_and(|at| now.duration_since(at) < interval) {
+                    last[slot] = seq;
+                    skipped += 1;
+                    if let Err(error) = release(&client, slot, seq) {
+                        if persist {
+                            println!("MEDIA_PRODUCER_LOST slot release failed: {error}");
+                            break;
+                        }
+                        bail!("slot release failed: {error}");
+                    }
+                    continue;
+                }
+                last_encoded = Some(now);
+            }
             if u32at(&b, 12) == 0 {
                 let ready = fds.pop().unwrap();
                 wait_ready(&ready)?;
@@ -456,20 +510,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             frames += 1;
             // encode_dmabuf returns only after VA has finished reading the imported image.
             // Returning this exact slot/sequence is the producer's reuse permission.
-            let mut ack = [0u8; 16];
-            ack[..4].copy_from_slice(&MAGIC.to_le_bytes());
-            ack[4..8].copy_from_slice(&(slot as u32).to_le_bytes());
-            ack[8..].copy_from_slice(&seq.to_le_bytes());
-            let n = unsafe {
-                libc::send(
-                    client.as_raw_fd(),
-                    ack.as_ptr().cast(),
-                    ack.len(),
-                    libc::MSG_NOSIGNAL,
-                )
-            };
-            if n != ack.len() as isize {
-                let error = std::io::Error::last_os_error();
+            if let Err(error) = release(&client, slot, seq) {
                 if persist {
                     println!("MEDIA_PRODUCER_LOST slot release failed: {error}");
                     break;
@@ -478,7 +519,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             }
             if frames <= 3 || frames % u64::from(framerate) == 0 {
                 println!(
-                    "MEDIA_ENCODED frames={frames} sequence={seq} bytes={} raw_cpu_bytes=0",
+                    "MEDIA_ENCODED frames={frames} sequence={seq} bytes={} raw_cpu_bytes=0 skipped={skipped}",
                     encoded.len()
                 );
             }

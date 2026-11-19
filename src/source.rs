@@ -155,7 +155,8 @@ pub use pose_ring::Pose;
 pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let usage = "usage: petplay-media SOCKET OUTPUT.h264 [QUIC_LISTEN_ADDR] \
         [--iroh-local|--iroh-share] [--fps N] [--bitrate BITS_PER_SECOND] \
-        [--layout mono|side-by-side] [--pose-ring PATH] [--pose-lag-us N] [--keyframe-seconds N]";
+        [--layout mono|side-by-side] [--pose-ring PATH] [--pose-lag-us N] [--keyframe-seconds N] \
+        [--persist]";
     let mut positional: Vec<&std::ffi::OsStr> = Vec::new();
     let mut transport = publish::Transport::Browser;
     let mut framerate = 75u32;
@@ -167,10 +168,16 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let mut pose_lag_us = 0u64;
     // A keyframe costs an encode spike and a burst of bytes; late joiners wait up to this long.
     let mut keyframe_seconds = 1u32;
+    // Keep serving after a producer leaves: accept the next one on the same socket, with the same
+    // encoder and broadcast. For long-lived feeds whose capture restarts (a desktop capture
+    // helper); without it the worker ends with its first producer.
+    let mut persist = false;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         let text = arg.to_str().context("non-UTF-8 argument")?;
-        if matches!(text, "--iroh-local" | "--iroh-share") {
+        if text == "--persist" {
+            persist = true;
+        } else if matches!(text, "--iroh-local" | "--iroh-share") {
             ensure!(
                 transport == publish::Transport::Browser,
                 "choose one of --iroh-local and --iroh-share"
@@ -254,17 +261,6 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         .transpose()?;
     let (listener, _path) = listen(socket)?;
     println!("MEDIA_READY socket={}", socket.display());
-    let client = owned(syscall(
-        unsafe {
-            libc::accept4(
-                listener.as_raw_fd(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                libc::SOCK_CLOEXEC,
-            )
-        },
-        "accept producer",
-    )?);
     let mut output = recording.then(|| File::create(output_path)).transpose()?;
     let mut journal = recording
         .then(|| File::create(output_path.with_extension("frames.jsonl")))
@@ -275,7 +271,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         .transpose()?;
     let mut encoder: Option<Encoder> = None;
     let mut geometry = None;
-    let mut last = [0u64; 3];
+    let mut last: [u64; 3];
     let mut frames = 0u64;
     let mut position = 0u64;
     let mut pose_ring: Option<pose_ring::PoseRing> = None;
@@ -289,172 +285,208 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
         t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
     };
-    while let Some((b, mut fds)) = receive(&client)? {
-        let slot = u32at(&b, 8) as usize;
-        let seq = u64at(&b, 16);
-        let timestamp = u64at(&b, 24);
-        let width = u32at(&b, 32);
-        let height = u32at(&b, 36);
-        let pitch = u32at(&b, 40);
-        let offset = u32at(&b, 44);
-        let modifier = u64at(&b, 48);
-        let format = u32at(&b, 56);
-        ensure!(
-            slot < 3
-                && seq > last[slot]
-                && (16..=8192).contains(&width)
-                && (16..=8192).contains(&height)
-                && width % 2 == 0
-                && height % 2 == 0
-                && pitch >= width * 4
-                && pitch <= 65536
-                && offset <= 65536
-                && modifier == 0
-                && format == 44,
-            "unsupported frame descriptor or sequence"
-        );
-        if u32at(&b, 12) == 0 {
-            let ready = fds.pop().unwrap();
-            wait_ready(&ready)?;
-        }
-        let image = fds.pop().unwrap();
-        if encoder.is_none() {
-            let mut cfg = Config::new(width, height, framerate, bitrate, framerate * keyframe_seconds);
-            cfg.device = Some("/dev/dri/renderD128".into());
-            encoder = Some(Encoder::new(cfg).context("hardware H.264 encoder")?);
-            geometry = Some((width, height));
-            if let Some(publisher) = publisher.as_mut() {
-                publisher.describe(publish::Format {
-                    width,
-                    height,
-                    framerate,
-                    layout,
-                });
-            }
-            println!(
-                "MEDIA_SOURCE width={width} height={height} fps={framerate} layout={layout:?}"
+    loop {
+        let client = owned(syscall(
+            unsafe {
+                libc::accept4(
+                    listener.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            },
+            "accept producer",
+        )?);
+        // Each producer numbers its own slots from the start; its first picture is a keyframe so
+        // receivers recover at once.
+        last = [0u64; 3];
+        let mut force_key = true;
+        loop {
+            let (b, mut fds) = match receive(&client) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => break,
+                Err(error) if persist => {
+                    println!("MEDIA_PRODUCER_LOST {error:#}");
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let slot = u32at(&b, 8) as usize;
+            let seq = u64at(&b, 16);
+            let timestamp = u64at(&b, 24);
+            let width = u32at(&b, 32);
+            let height = u32at(&b, 36);
+            let pitch = u32at(&b, 40);
+            let offset = u32at(&b, 44);
+            let modifier = u64at(&b, 48);
+            let format = u32at(&b, 56);
+            ensure!(
+                slot < 3
+                    && seq > last[slot]
+                    && (16..=8192).contains(&width)
+                    && (16..=8192).contains(&height)
+                    && width % 2 == 0
+                    && height % 2 == 0
+                    && pitch >= width * 4
+                    && pitch <= 65536
+                    && offset <= 65536
+                    && modifier == 0
+                    && format == 44,
+                "unsupported frame descriptor or sequence"
             );
-        }
-        ensure!(
-            geometry == Some((width, height)),
-            "stream resize requires a new session"
-        );
-        let start = Instant::now();
-        let picked_up = monotonic();
-        let key = frames % u64::from(framerate * keyframe_seconds) == 0;
-        let buffer = DmaBuf {
-            drm_format: drm::ARGB8888,
-            modifier,
-            width,
-            height,
-            planes: vec![Plane { offset, pitch }],
-            fd: image,
-            color: None,
-        };
-        let encoded = encoder
-            .as_mut()
-            .unwrap()
-            .encode_dmabuf(buffer, key)
-            .context("strict GPU DMA-BUF encode")?;
-        ensure!(!encoded.is_empty(), "empty encoded frame");
-        let encoded_at = monotonic();
-        if let Some(publisher) = publisher.as_mut() {
-            publisher.frame(&encoded, key, timestamp)?;
-            if let Some(trace) = frame_trace.as_mut() {
-                // Capture time and µs after it: picked up, encoded, handed to MoQ.
-                writeln!(
-                    trace,
-                    "{timestamp} {} {} {} {} {key}",
-                    picked_up.saturating_sub(timestamp) / 1000,
-                    encoded_at.saturating_sub(timestamp) / 1000,
-                    monotonic().saturating_sub(timestamp) / 1000,
-                    encoded.len(),
-                )?;
+            if u32at(&b, 12) == 0 {
+                let ready = fds.pop().unwrap();
+                wait_ready(&ready)?;
             }
-            // The driver creates the ring when SteamVR starts, usually after this worker.
-            if let Some(path) = pose_path.as_ref().filter(|_| pose_ring.is_none()) {
-                if pose_retry.elapsed() > Duration::from_secs(1) || frames == 0 {
-                    pose_retry = Instant::now();
-                    match pose_ring::PoseRing::open(path) {
-                        Ok(ring) => {
-                            println!("POSE_RING_READY path={}", path.display());
-                            pose_ring = Some(ring);
+            let image = fds.pop().unwrap();
+            if encoder.is_none() {
+                let mut cfg = Config::new(width, height, framerate, bitrate, framerate * keyframe_seconds);
+                cfg.device = Some("/dev/dri/renderD128".into());
+                encoder = Some(Encoder::new(cfg).context("hardware H.264 encoder")?);
+                geometry = Some((width, height));
+                if let Some(publisher) = publisher.as_mut() {
+                    publisher.describe(publish::Format {
+                        width,
+                        height,
+                        framerate,
+                        layout,
+                    });
+                }
+                println!(
+                    "MEDIA_SOURCE width={width} height={height} fps={framerate} layout={layout:?}"
+                );
+            }
+            ensure!(
+                geometry == Some((width, height)),
+                "stream resize requires a new session"
+            );
+            let start = Instant::now();
+            let picked_up = monotonic();
+            let key = force_key || frames % u64::from(framerate * keyframe_seconds) == 0;
+            force_key = false;
+            let buffer = DmaBuf {
+                drm_format: drm::ARGB8888,
+                modifier,
+                width,
+                height,
+                planes: vec![Plane { offset, pitch }],
+                fd: image,
+                color: None,
+            };
+            let encoded = encoder
+                .as_mut()
+                .unwrap()
+                .encode_dmabuf(buffer, key)
+                .context("strict GPU DMA-BUF encode")?;
+            ensure!(!encoded.is_empty(), "empty encoded frame");
+            let encoded_at = monotonic();
+            if let Some(publisher) = publisher.as_mut() {
+                publisher.frame(&encoded, key, timestamp)?;
+                if let Some(trace) = frame_trace.as_mut() {
+                    // Capture time and µs after it: picked up, encoded, handed to MoQ.
+                    writeln!(
+                        trace,
+                        "{timestamp} {} {} {} {} {key}",
+                        picked_up.saturating_sub(timestamp) / 1000,
+                        encoded_at.saturating_sub(timestamp) / 1000,
+                        monotonic().saturating_sub(timestamp) / 1000,
+                        encoded.len(),
+                    )?;
+                }
+                // The driver creates the ring when SteamVR starts, usually after this worker.
+                if let Some(path) = pose_path.as_ref().filter(|_| pose_ring.is_none()) {
+                    if pose_retry.elapsed() > Duration::from_secs(1) || frames == 0 {
+                        pose_retry = Instant::now();
+                        match pose_ring::PoseRing::open(path) {
+                            Ok(ring) => {
+                                println!("POSE_RING_READY path={}", path.display());
+                                pose_ring = Some(ring);
+                            }
+                            Err(err) if frames % u64::from(framerate) == 0 => {
+                                println!("POSE_RING_WAITING {err:#}")
+                            }
+                            Err(_) => {}
                         }
-                        Err(err) if frames % u64::from(framerate) == 0 => {
-                            println!("POSE_RING_WAITING {err:#}")
-                        }
-                        Err(_) => {}
+                    }
+                }
+                let sampled = timestamp.saturating_sub(pose_lag_us * 1000);
+                if let Some(pose) = pose_ring.as_ref().and_then(|ring| ring.at(sampled)) {
+                    let age = ((timestamp - pose.time_ns.min(timestamp)) / 1000).min(u64::from(u32::MAX));
+                    publisher.pose(timestamp, &pose, age as u32)?;
+                    tagged += 1;
+                    let hz = u128::from(framerate);
+                    let phase = ((u128::from(timestamp) * hz % 1_000_000_000) / hz / 1000) as u64;
+                    let published = monotonic();
+                    for (series, value) in timing.iter_mut().zip([
+                        phase,
+                        pose.time_ns.saturating_sub(pose.held_ns) / 1000,
+                        age,
+                        published.saturating_sub(timestamp) / 1000,
+                    ]) {
+                        series.push(value);
+                    }
+                    if tagged % u64::from(framerate) == 0 {
+                        let summary = |v: &mut Vec<u64>| {
+                            v.sort_unstable();
+                            let text = format!("{}/{}", v[v.len() / 2], v[v.len() - 1]);
+                            v.clear();
+                            text
+                        };
+                        let [phase, wait, latch, publish] = &mut timing;
+                        println!(
+                            "POSE_TIMING_US median/max capture_after_tick={} arrival_to_latch={} latch_to_capture={} capture_to_published={} sequence={}",
+                            summary(phase), summary(wait), summary(latch), summary(publish), pose.client_sequence
+                        );
                     }
                 }
             }
-            let sampled = timestamp.saturating_sub(pose_lag_us * 1000);
-            if let Some(pose) = pose_ring.as_ref().and_then(|ring| ring.at(sampled)) {
-                let age = ((timestamp - pose.time_ns.min(timestamp)) / 1000).min(u64::from(u32::MAX));
-                publisher.pose(timestamp, &pose, age as u32)?;
-                tagged += 1;
-                let hz = u128::from(framerate);
-                let phase = ((u128::from(timestamp) * hz % 1_000_000_000) / hz / 1000) as u64;
-                let published = monotonic();
-                for (series, value) in timing.iter_mut().zip([
-                    phase,
-                    pose.time_ns.saturating_sub(pose.held_ns) / 1000,
-                    age,
-                    published.saturating_sub(timestamp) / 1000,
-                ]) {
-                    series.push(value);
+            if let Some(output) = output.as_mut() {
+                output.write_all(&encoded)?;
+            }
+            if let Some(journal) = journal.as_mut() {
+                writeln!(
+                    journal,
+                    "{{\"sequence\":{seq},\"timestamp_ns\":{timestamp},\"offset\":{position},\"bytes\":{},\"keyframe\":{key},\"encode_ms\":{:.3}}}",
+                    encoded.len(),
+                    start.elapsed().as_secs_f64() * 1000.
+                )?;
+            }
+            position += encoded.len() as u64;
+            last[slot] = seq;
+            frames += 1;
+            // encode_dmabuf returns only after VA has finished reading the imported image.
+            // Returning this exact slot/sequence is the producer's reuse permission.
+            let mut ack = [0u8; 16];
+            ack[..4].copy_from_slice(&MAGIC.to_le_bytes());
+            ack[4..8].copy_from_slice(&(slot as u32).to_le_bytes());
+            ack[8..].copy_from_slice(&seq.to_le_bytes());
+            let n = unsafe {
+                libc::send(
+                    client.as_raw_fd(),
+                    ack.as_ptr().cast(),
+                    ack.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            if n != ack.len() as isize {
+                let error = std::io::Error::last_os_error();
+                if persist {
+                    println!("MEDIA_PRODUCER_LOST slot release failed: {error}");
+                    break;
                 }
-                if tagged % u64::from(framerate) == 0 {
-                    let summary = |v: &mut Vec<u64>| {
-                        v.sort_unstable();
-                        let text = format!("{}/{}", v[v.len() / 2], v[v.len() - 1]);
-                        v.clear();
-                        text
-                    };
-                    let [phase, wait, latch, publish] = &mut timing;
-                    println!(
-                        "POSE_TIMING_US median/max capture_after_tick={} arrival_to_latch={} latch_to_capture={} capture_to_published={} sequence={}",
-                        summary(phase), summary(wait), summary(latch), summary(publish), pose.client_sequence
-                    );
-                }
+                bail!("slot release failed: {error}");
+            }
+            if frames <= 3 || frames % u64::from(framerate) == 0 {
+                println!(
+                    "MEDIA_ENCODED frames={frames} sequence={seq} bytes={} raw_cpu_bytes=0",
+                    encoded.len()
+                );
             }
         }
-        if let Some(output) = output.as_mut() {
-            output.write_all(&encoded)?;
+        if !persist {
+            break;
         }
-        if let Some(journal) = journal.as_mut() {
-            writeln!(
-                journal,
-                "{{\"sequence\":{seq},\"timestamp_ns\":{timestamp},\"offset\":{position},\"bytes\":{},\"keyframe\":{key},\"encode_ms\":{:.3}}}",
-                encoded.len(),
-                start.elapsed().as_secs_f64() * 1000.
-            )?;
-        }
-        position += encoded.len() as u64;
-        last[slot] = seq;
-        frames += 1;
-        // encode_dmabuf returns only after VA has finished reading the imported image.
-        // Returning this exact slot/sequence is the producer's reuse permission.
-        let mut ack = [0u8; 16];
-        ack[..4].copy_from_slice(&MAGIC.to_le_bytes());
-        ack[4..8].copy_from_slice(&(slot as u32).to_le_bytes());
-        ack[8..].copy_from_slice(&seq.to_le_bytes());
-        let n = unsafe {
-            libc::send(
-                client.as_raw_fd(),
-                ack.as_ptr().cast(),
-                ack.len(),
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if n != ack.len() as isize {
-            bail!("slot release failed: {}", std::io::Error::last_os_error());
-        }
-        if frames <= 3 || frames % u64::from(framerate) == 0 {
-            println!(
-                "MEDIA_ENCODED frames={frames} sequence={seq} bytes={} raw_cpu_bytes=0",
-                encoded.len()
-            );
-        }
+        println!("MEDIA_PRODUCER_DONE frames={frames}");
     }
     println!("MEDIA_DONE frames={frames} encoded_bytes={position}");
     Ok(())

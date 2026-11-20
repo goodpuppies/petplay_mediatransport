@@ -2,7 +2,7 @@
 name = "petplay-link-web"
 version = "0.1.0"
 edition = "2024"
-description = "Browser side of petplay-media link: an iroh endpoint (relay-only) for stageforge hub links."
+description = "Browser side of petplay-media link: an iroh endpoint (relay-only) that dials and accepts stageforge remote connections."
 
 [lib]
 crate-type = ["cdylib"]

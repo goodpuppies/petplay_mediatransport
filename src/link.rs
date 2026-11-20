@@ -1,26 +1,26 @@
-//! `petplay-media link`: an iroh endpoint that carries stageforge hub-to-hub links.
+//! `petplay-media link`: a process's iroh node for stageforge remote actors.
 //!
-//! A PetPlay hub starts this as a child process and drives it over stdio with newline-delimited
-//! JSON, so no native code loads into the hub and the same protocol works on every platform.
-//! Each link is one iroh connection with ALPN [`ALPN`] and one bidirectional stream of
-//! length-prefixed UTF-8 frames (the hub's link frames, already JSON text).
+//! A PetPlay process starts this as a child and drives it over stdio with newline-delimited
+//! JSON, so no native code loads into PetPlay and the same protocol works on every platform.
+//! Each connection is one iroh connection with ALPN [`ALPN`] and one bidirectional stream of
+//! length-prefixed UTF-8 frames (actor messages, already JSON text). The dialer writes first.
 //!
-//! Hub → link (stdin):
+//! PetPlay → link (stdin):
 //! - `{"op":"connect","req":N,"endpoint":{"id":…,"relay":…?,"addrs":[…]?}}`
 //! - `{"op":"send","conn":C,"data":"…"}`
 //! - `{"op":"close","conn":C,"reason":"…"}`
 //!
-//! Link → hub (stdout):
+//! Link → PetPlay (stdout):
 //! - `{"ev":"ready","id":…,"relay":…|null,"addrs":[…]}` once, when the endpoint can be reached
 //! - `{"ev":"connected","req":N,"conn":C}` / `{"ev":"failed","req":N,"error":…}`
 //! - `{"ev":"incoming","conn":C,"peer":…}`
 //! - `{"ev":"data","conn":C,"data":"…"}`
 //! - `{"ev":"closed","conn":C,"reason":…}`
 //!
-//! The endpoint id plus relay URL is what a hub publishes in a topic record: it identifies and
+//! The endpoint id plus relay URL is what a process publishes in a topic record: it identifies and
 //! authenticates the peer and reveals no IP address. iroh holepunches to a direct path through
 //! the relay when it can; until then (and always, for browsers) frames go through the relay,
-//! end-to-end encrypted. Better transports are negotiated over the link afterwards.
+//! end-to-end encrypted. Actors negotiate better transports between themselves afterwards.
 //!
 //! `--relay URL` uses that relay (a self-hosted `iroh-relay`, or `iroh-relay --dev` for tests)
 //! instead of n0's public ones. `--local` binds loopback only with no relay, for tests on one
@@ -99,7 +99,7 @@ async fn serve(local: bool, relay: Option<RelayUrl>) -> Result<()> {
             .bind_addr("127.0.0.1:0".parse::<SocketAddr>()?)?
     } else {
         // `Minimal` publishes nothing about this endpoint; peers reach it by the id and relay
-        // URL a hub hands them. The relay coordinates holepunching.
+        // URL a process hands them. The relay coordinates holepunching.
         Endpoint::builder(presets::Minimal).relay_mode(match relay {
             Some(url) => RelayMode::custom([url]),
             None => default_relay_mode(),
@@ -141,7 +141,7 @@ async fn serve(local: bool, relay: Option<RelayUrl>) -> Result<()> {
 
     let acceptor = tokio::spawn(accept_loop(state.clone()));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    // The hub owns this process: stdin closing means the hub is gone.
+    // PetPlay owns this process: stdin closing means it is gone.
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -280,7 +280,7 @@ fn start_conn(
     let conn = state.next_conn.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<ConnCommand>();
     state.conns.lock().unwrap().insert(conn, tx);
-    // Announced before the reader starts, so the hub knows the connection before its data.
+    // Announced before the reader starts, so PetPlay knows the connection before its data.
     let _ = state.out.send(announce(conn));
 
     let writer_connection = connection.clone();

@@ -1,12 +1,13 @@
 //! Browser side of `petplay-media link` (see ../src/link.rs): the same ALPN and frame format,
-//! built for `wasm32-unknown-unknown`. iroh in a browser is relay-only (no UDP), so this only
-//! dials: it connects to a hub's endpoint id through that hub's relay. The hub then negotiates
-//! a direct transport over the link.
+//! built for `wasm32-unknown-unknown`. iroh in a browser is relay-only (no UDP): it dials other
+//! endpoints through their relay, and is reached through its own. A page therefore publishes
+//! `{id, relay}` like any other process, and is dialed and accepts like one.
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl,
     address_lookup::MemoryLookup,
     endpoint::{Connection, RecvStream, RelayMode, SendStream, presets},
+    TransportAddr, Watcher,
 };
 use js_sys::{Object, Promise, Reflect};
 use std::rc::Rc;
@@ -30,7 +31,8 @@ pub struct LinkEndpoint {
 
 #[wasm_bindgen]
 impl LinkEndpoint {
-    /// Bind an endpoint. `relay` replaces n0's public relays (a self-hosted or dev relay).
+    /// Bind an endpoint and wait until it is connected to its relay, so it can be reached.
+    /// `relay` replaces n0's public relays (a self-hosted or dev relay).
     pub fn bind(relay: Option<String>) -> Promise {
         future_to_promise(async move {
             let lookup = MemoryLookup::new();
@@ -41,15 +43,56 @@ impl LinkEndpoint {
             let endpoint = Endpoint::builder(presets::Minimal)
                 .relay_mode(mode)
                 .address_lookup(lookup.clone())
+                .alpns(vec![ALPN.to_vec()])
                 .bind()
                 .await
                 .map_err(js_error)?;
+            endpoint.online().await;
             Ok(LinkEndpoint { endpoint, lookup }.into())
         })
     }
 
     pub fn id(&self) -> String {
         self.endpoint.id().to_string()
+    }
+
+    /// The relay this endpoint is reached through (its home relay).
+    pub fn relay(&self) -> Option<String> {
+        self.endpoint
+            .watch_addr()
+            .get()
+            .addrs
+            .iter()
+            .find_map(|entry| match entry {
+                TransportAddr::Relay(url) => Some(url.to_string()),
+                _ => None,
+            })
+    }
+
+    /// The next incoming link connection, or `undefined` once the endpoint is closed. The
+    /// dialer opens the stream and writes first; that first frame is what announces it.
+    pub fn accept(&self) -> Promise {
+        let endpoint = self.endpoint.clone();
+        future_to_promise(async move {
+            loop {
+                let Some(incoming) = endpoint.accept().await else {
+                    return Ok(JsValue::UNDEFINED);
+                };
+                let accepted = async {
+                    let connection = incoming.await.map_err(js_error)?;
+                    let (send, recv) = connection.accept_bi().await.map_err(js_error)?;
+                    Ok::<_, JsValue>(LinkConnection {
+                        connection,
+                        send: Rc::new(Mutex::new(send)),
+                        recv: Rc::new(Mutex::new(recv)),
+                    })
+                };
+                // One failed handshake must not end accepting.
+                if let Ok(connection) = accepted.await {
+                    return Ok(connection.into());
+                }
+            }
+        })
     }
 
     /// Dial a hub's link endpoint by id, through its relay.
@@ -90,6 +133,11 @@ pub struct LinkConnection {
 
 #[wasm_bindgen]
 impl LinkConnection {
+    /// The endpoint id at the other end.
+    pub fn peer(&self) -> String {
+        self.connection.remote_id().to_string()
+    }
+
     /// Send one frame. Calls are written in call order.
     pub fn send(&self, text: String) -> Promise {
         let send = self.send.clone();

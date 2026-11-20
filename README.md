@@ -265,18 +265,20 @@ encoder's required API 13.1. No FFmpeg capture filters or chained FFmpeg process
 The native publisher exits when capture/encoding ends. The caller owns the lifetime of the
 capturer and encoder and must stop its process tree during teardown.
 
-## Hub links (`link`)
+## Remote connections (`link`)
 
-`petplay-media link` is an iroh endpoint for stageforge hub-to-hub links, driven over stdio
-with newline-delimited JSON by a PetPlay hub (`classes/irohLinkCarrier.ts` in PetPlay). Each
-link is one iroh connection with ALPN `petplay/link/1` and one bidirectional stream of
-length-prefixed UTF-8 frames. A hub publishes only `{id, relay}` (no IP addresses) in topic
+`petplay-media link` is a process's iroh node for stageforge remote actors, driven over stdio with
+newline-delimited JSON by PetPlay (`classes/irohCarrier.ts`). Each connection is one iroh
+connection with ALPN `petplay/link/1` and one bidirectional stream of length-prefixed UTF-8
+frames; the dialer writes first. A process publishes only `{id, relay}` (no IP addresses) in topic
 records; peers dial by id through that relay and iroh holepunches to a direct path when it can.
 `--relay URL` uses a self-hosted or dev relay; `--local` is loopback only, for tests. Needs
 `--features iroh`; see `src/link.rs` for the protocol.
 
 `link-web/` is the browser side: the same ALPN and framing in a wasm-bindgen crate pinned to the
-same iroh (=1.4.1). Browsers are relay-only, so it only dials. Build with `link-web/build.sh`
-(needs `rustup target add wasm32-unknown-unknown` and wasm-bindgen-cli =0.2.130), which writes
-`pkg-web` (pages) and `pkg-deno` (tests). For a local relay, `cargo install iroh-relay --version
-=1.4.1 --features server --locked --root target/tools`, then `iroh-relay --dev`.
+same iroh (=1.4.1). Browsers are relay-only: a page dials through the other side's relay and is
+reached through its own, so it publishes `{id, relay}` and accepts like any process. Build with
+`link-web/build.sh` (needs `rustup target add wasm32-unknown-unknown` and wasm-bindgen-cli
+=0.2.130), which writes `pkg-web` (pages) and `pkg-deno` (tests). For a local relay, `cargo
+install iroh-relay --version =1.4.1 --features server --locked --root target/tools`, then
+`iroh-relay --dev`.

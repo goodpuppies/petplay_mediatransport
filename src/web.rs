@@ -13,11 +13,18 @@ pub fn start(quic: SocketAddr, fingerprint: &str) -> Result<()> {
     );
     let listener = TcpListener::bind(http)?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web");
-    // Checked once so a missing build fails at startup; served fresh on every request, so a
-    // rebuilt viewer reaches browsers without restarting the gateway.
-    std::fs::metadata(root.join("index.html"))?;
-    std::fs::metadata(root.join("dist/viewer.js"))
-        .context("run bun install and bun run build in the mediatransport web/ directory")?;
+    // The viewer pages come from the source tree, served fresh on every request so a rebuilt
+    // viewer reaches browsers without restarting the gateway. A binary run away from its checkout
+    // (the household agent) has none: it still serves /config.json, which is all a client that
+    // brings its own page needs.
+    if std::fs::metadata(root.join("index.html")).is_err()
+        || std::fs::metadata(root.join("dist/viewer.js")).is_err()
+    {
+        eprintln!(
+            "no viewer pages at {}: serving /config.json only (bun install && bun run build in web/ for the viewer)",
+            root.display()
+        );
+    }
     let config =
         format!("{{\"url\":\"https://{quic}/\",\"fingerprint\":\"{fingerprint}\"}}").into_bytes();
     std::thread::spawn(move || {

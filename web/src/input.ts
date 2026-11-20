@@ -19,6 +19,21 @@ export function attachRemoteInput(
       socket.send(JSON.stringify(message));
     }
   };
+  const controls = document.createElement("span");
+  const setButtonsEnabled = (enabled: boolean) => {
+    for (const button of controls.querySelectorAll("button")) button.disabled = !enabled;
+  };
+  for (const [button, label] of [
+    ["dashboard", "SteamVR dashboard"],
+    ["left-trigger", "Left trigger"],
+    ["right-trigger", "Right trigger"],
+  ]) {
+    const control = document.createElement("button");
+    control.type = "button";
+    control.textContent = label;
+    control.onclick = () => send({ type: "controller-button", button });
+    controls.append(control);
+  }
   const message = (event: MessageEvent) => {
     const config = JSON.parse(event.data);
     if (config.version !== 1 || config.viewport !== "steamvr-stereo") {
@@ -28,11 +43,16 @@ export function attachRemoteInput(
     viewport = config.viewport;
     ready = true;
     status.textContent = " · Input connected";
+    if (config.controllerButtons) {
+      document.querySelector("header")?.append(controls);
+      setButtonsEnabled(true);
+    }
   };
   socket.addEventListener("message", message);
   socket.addEventListener("close", () => {
     ready = false;
     status.textContent = " · Input disconnected";
+    setButtonsEnabled(false);
   });
   socket.addEventListener("error", () => {
     status.textContent = " · Input connection failed";
@@ -101,6 +121,7 @@ export function attachRemoteInput(
     document.removeEventListener("visibilitychange", visibility);
     removeEventListener("pagehide", close);
     status.remove();
+    controls.remove();
   };
   addEventListener("pagehide", close, { once: true });
   return close;

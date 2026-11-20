@@ -5,6 +5,8 @@ mod annexb_source;
 mod capture_source;
 mod gateway;
 #[cfg(feature = "iroh")]
+mod link;
+#[cfg(feature = "iroh")]
 mod peer;
 mod publish;
 #[cfg(all(feature = "decode", target_os = "linux"))]
@@ -58,6 +60,12 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "native receive needs Linux --features decode or Windows --features decode-windows"
         );
+    }
+    if args.get(1).is_some_and(|a| a == "link") {
+        #[cfg(feature = "iroh")]
+        return link::run(&args[2..]);
+        #[cfg(not(feature = "iroh"))]
+        anyhow::bail!("link needs --features iroh");
     }
     if args.get(1).is_some_and(|a| a == "gateway") {
         return gateway::run(&args[2..]);

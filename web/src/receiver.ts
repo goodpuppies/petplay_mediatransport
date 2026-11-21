@@ -426,5 +426,7 @@ export async function connectReceiver(options: ReceiverOptions) {
     takeDue,
     clearPending,
     run,
+    /** Ends the feed: `run` returns and releases the decoder and connection. */
+    close: () => connection.close(),
   };
 }

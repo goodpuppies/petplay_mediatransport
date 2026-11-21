@@ -20,6 +20,20 @@ pub struct Input {
 }
 impl Input {
     pub fn connect(args: &[std::ffi::OsString]) -> Result<Self> {
+        // `https://HOST:PORT/ FINGERPRINT`: a source's own WebTransport listener, the feed a
+        // browser takes, pinned to its self-signed certificate. No iroh involved.
+        let pinned = if args.len() == 3
+            && args[0].to_str().is_some_and(|url| url.starts_with("https://"))
+        {
+            let fingerprint = args[1].to_str().context("fingerprint")?.to_ascii_lowercase();
+            ensure!(
+                fingerprint.len() == 64 && fingerprint.bytes().all(|b| b.is_ascii_hexdigit()),
+                "the fingerprint is the certificate's SHA-256, as 64 hex digits"
+            );
+            Some((args[0].to_str().context("URL")?.parse::<url::Url>()?, fingerprint))
+        } else {
+            None
+        };
         let shared = if args.len() == 2 {
             Some(crate::peer::decode(
                 args[0].to_str().context("share code")?,
@@ -27,7 +41,9 @@ impl Input {
         } else {
             None
         };
-        let (url, direct) = if let Some(addr) = &shared {
+        let (url, direct) = if let Some((url, _)) = &pinned {
+            (url.clone(), Vec::new())
+        } else if let Some(addr) = &shared {
             (
                 format!("iroh://{}/", addr.id).parse()?,
                 crate::peer::direct_addresses(addr),
@@ -45,24 +61,30 @@ impl Input {
         let (tx, rx) = sync_channel::<Unit>(3);
         let network = runtime.spawn(async move {
             let _ = moq_tokio::crypto::install_default();
-            let endpoint = if let Some(addr) = shared.clone() {
-                crate::peer::endpoint(Some(addr)).await?
-            } else {
-                crate::publish::local_endpoint().await?
-            };
             let origin = moq_tokio::origin::spawn();
             let consumer = origin.consume();
             let mut config = moq_tokio::connect::Config::default();
             config.once = Some(true);
-            let client = config
-                .init(Default::default())?
-                .with_iroh(endpoint.clone())
-                .with_iroh_addrs(direct)
-                .with_subscriber(origin);
+            let (client, endpoint) = if let Some((_, fingerprint)) = &pinned {
+                config.tls.fingerprint = vec![fingerprint.clone()];
+                (config.init(Default::default())?.with_subscriber(origin), None)
+            } else {
+                let endpoint = if let Some(addr) = shared.clone() {
+                    crate::peer::endpoint(Some(addr)).await?
+                } else {
+                    crate::publish::local_endpoint().await?
+                };
+                let client = config
+                    .init(Default::default())?
+                    .with_iroh(endpoint.clone())
+                    .with_iroh_addrs(direct)
+                    .with_subscriber(origin);
+                (client, Some(endpoint))
+            };
             let session = client.connect(url);
             let stream = async {
-                if let Some(addr) = &shared {
-                    crate::peer::require_direct(&endpoint, addr.id, Duration::from_secs(15))
+                if let (Some(addr), Some(endpoint)) = (&shared, &endpoint) {
+                    crate::peer::require_direct(endpoint, addr.id, Duration::from_secs(15))
                         .await?;
                     println!("RECEIVER_DIRECT");
                 }
@@ -153,7 +175,7 @@ impl Input {
                 Ok::<_, anyhow::Error>(())
             };
             tokio::pin!(stream);
-            if let Some(addr) = shared.clone() {
+            if let (Some(addr), Some(endpoint)) = (shared.clone(), endpoint.clone()) {
                 let policy = async {
                     crate::peer::require_direct(&endpoint, addr.id, Duration::from_secs(15))
                         .await?;

@@ -10,7 +10,7 @@ use std::{path::Path, sync::mpsc::RecvTimeoutError, time::Duration};
 pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     ensure!(
         (2..=3).contains(&args.len()),
-        "usage: petplay-media receive SHARE_CODE SOCKET\n or: petplay-media receive IROH_URL DIRECT_ADDRESS SOCKET"
+        "usage: petplay-media receive SHARE_CODE SOCKET\n or: petplay-media receive IROH_URL DIRECT_ADDRESS SOCKET\n or: petplay-media receive https://HOST:PORT/ CERT_SHA256 SOCKET"
     );
     let mut output = crate::receive_output::Output::bind(Path::new(&args[args.len() - 1]))?;
     let input = crate::receive_input::Input::connect(args)?;

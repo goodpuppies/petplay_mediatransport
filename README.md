@@ -138,6 +138,8 @@ receiver without the encoder). A mono source started with `--layout mono` is req
 target/release/petplay-media receive SHARE_CODE /PRIVATE_DIRECTORY/frames.sock
 # Local transport test instead of a share code:
 target/release/petplay-media receive iroh://SOURCE_ID/ SOURCE_ADDRESS /PRIVATE_DIRECTORY/frames.sock
+# A source's own WebTransport listener (what a browser takes), pinned to its certificate:
+target/release/petplay-media receive https://HOST:PORT/ CERT_SHA256_HEX /PRIVATE_DIRECTORY/frames.sock
 ```
 
 The worker binds a mode-0600 Unix seqpacket socket, prints `RECEIVER_READY`, and waits for its

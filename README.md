@@ -19,10 +19,15 @@ This is an early video prototype with Linux encoding and Linux/Windows native re
 - Decode mono H.264 on Linux VA-API into RGB DMA-BUF slots, or on Windows Media Foundation
   into a persistent shared D3D11 RGB texture.
 - Optionally record encoded H.264 and a frame journal.
+- Desktop audio (`src/audio.rs`): Opus at 48 kHz stereo on its own broadcast. On Windows,
+  `capture-audio [LISTEN] [--iroh-share] [--exclude NAME.exe]` captures every app's sound but
+  VRChat's and PetPlay's, one process-loopback client per audio session, mixed;
+  `receive-audio SHARE_CODE | https://HOST:PORT/ CERT_SHA256` plays a source on the default
+  output through an 80 ms jitter buffer with drift correction. Linux capture is not done yet.
 
 The feed's geometry comes from the producer's first frame descriptor; `--fps`, `--bitrate` and
 `--layout mono|side-by-side` set the rest, defaulting to 75 fps, 12 Mbps and side-by-side for
-the SteamVR source. It uses `/dev/dri/renderD128` and a three-slot producer pool. Audio, arbitrary geometry, other GPU APIs,
+the SteamVR source. It uses `/dev/dri/renderD128` and a three-slot producer pool. Arbitrary geometry, other GPU APIs,
 other operating systems, and general remote Iroh discovery are not implemented yet. The
 current MoQ tracks are a custom protocol, not a generic Hang catalog.
 

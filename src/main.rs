@@ -1,6 +1,10 @@
 //! Native media worker. Only DMA-BUF descriptors and encoded bytes cross CPU memory.
 #[cfg(feature = "publish")]
 mod annexb_source;
+#[cfg(feature = "audio")]
+mod audio;
+#[cfg(all(feature = "capture-windows", target_os = "windows"))]
+mod audio_windows;
 #[cfg(all(feature = "publish", target_os = "windows"))]
 mod capture_source;
 mod gateway;
@@ -13,7 +17,8 @@ mod publish;
 mod receive;
 #[cfg(any(
     all(feature = "decode", target_os = "linux"),
-    all(feature = "decode-windows", target_os = "windows")
+    all(feature = "decode-windows", target_os = "windows"),
+    feature = "audio"
 ))]
 mod receive_input;
 #[cfg(all(feature = "decode", target_os = "linux"))]
@@ -70,6 +75,18 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "native receive needs Linux --features decode or Windows --features decode-windows"
         );
+    }
+    if args.get(1).is_some_and(|a| a == "capture-audio") {
+        #[cfg(all(feature = "capture-windows", target_os = "windows"))]
+        return audio_windows::run(&args[2..]);
+        #[cfg(not(all(feature = "capture-windows", target_os = "windows")))]
+        anyhow::bail!("capture-audio needs Windows and --features capture-windows (Linux: soon)");
+    }
+    if args.get(1).is_some_and(|a| a == "receive-audio") {
+        #[cfg(feature = "audio")]
+        return audio::receive(&args[2..]);
+        #[cfg(not(feature = "audio"))]
+        anyhow::bail!("receive-audio needs --features audio");
     }
     if args.get(1).is_some_and(|a| a == "link") {
         #[cfg(feature = "iroh")]

@@ -248,6 +248,29 @@ back into the selected source eye before sending, including during captured drag
 aspect ratio is preserved on narrow screens so CSS scaling does not offset picking.
 
 
+## Windows GPU source (`capture-wgc`)
+
+Build with `--no-default-features --features decode-windows,capture-windows` (it needs
+`../screen-streamer/capture`, the `petplay-capture` crate). One monitor is captured with Windows
+Graphics Capture, converted BGRA→NV12 on the D3D11 video processor and encoded by the GPU's
+hardware H.264 Media Foundation encoder (NVENC, AMF or Quick Sync), then published like the Linux
+encoder. No pixel is read back to the CPU and no FFmpeg is involved.
+
+```sh
+petplay-media capture-wgc --list                      # WGC_MONITOR index=… name=… width=… height=…
+petplay-media capture-wgc 0 --iroh-share              # IROH_SHARE code=…, for `receive SHARE_CODE`
+petplay-media capture-wgc 0 100.64.0.5:4470           # pinned WebTransport listener instead
+```
+
+Capture needs the logged-on desktop session: a process started over SSH runs in another session
+and cannot capture. A still screen repeats its last picture 4 times, then once a second with a
+keyframe per `--keyframe-seconds`. Checked 2026-11-21 on a GTX 1660 Ti laptop: NVIDIA H.264
+Encoder MFT, received and decoded on Linux over a direct iroh path.
+
+Cross-building from Linux works with `mingw-w64-gcc` installed:
+`cargo build --release --target x86_64-pc-windows-gnu --no-default-features --features
+decode-windows,capture-windows`.
+
 ## Existing Rust desktop capture on Windows
 
 A `publish` feature enables already-encoded ingress independently of a platform encoder.

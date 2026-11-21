@@ -10,6 +10,11 @@
 //!
 //! It prints `AUDIO_PLAYING device=… rate=…` once the output runs and `AUDIO_STATS` every
 //! five seconds.
+//!
+//! Where the platform capture lives elsewhere (Linux: PipeWire, set up by PetPlay), a source
+//! publishes raw PCM from stdin, f32 little-endian interleaved stereo at 48 kHz:
+//!
+//!   pw-record … - | petplay-media capture-audio --stdin [LISTEN_ADDR] [--iroh-share] [--bitrate N]
 use crate::publish::{Transport, serve};
 use anyhow::{Context, Result, ensure};
 use moq_net::{Timescale, Timestamp, group, origin, track};
@@ -24,8 +29,6 @@ pub const CHANNELS: usize = 2;
 pub const FRAME: usize = 960;
 const PACKETS_PER_GROUP: u32 = 50;
 
-// Linux publishes once its capture lands; Windows already does.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct AudioPublisher {
     pub fingerprint: String,
     _runtime: tokio::runtime::Runtime,
@@ -228,6 +231,66 @@ fn open_output(jitter: Arc<Mutex<Jitter>>) -> Result<cpal::Stream> {
         device.name().unwrap_or_default()
     );
     Ok(stream)
+}
+
+/// `capture-audio --stdin`: publish raw PCM from stdin, paced by its arrival.
+pub fn capture_stdin(args: &[std::ffi::OsString]) -> Result<()> {
+    use std::io::Read;
+    let (mut share, mut bitrate) = (false, 128_000i32);
+    let mut positional = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let text = arg.to_str().context("non-UTF-8 argument")?;
+        match text {
+            "--stdin" => {}
+            "--iroh-share" => share = true,
+            "--bitrate" => {
+                bitrate = rest
+                    .next()
+                    .context("--bitrate needs a value")?
+                    .to_str()
+                    .context("bitrate")?
+                    .parse()?
+            }
+            _ if text.starts_with("--") => anyhow::bail!("unknown option {text}"),
+            _ => positional.push(text.to_owned()),
+        }
+    }
+    ensure!(
+        positional.len() <= 1 && (16_000..=510_000).contains(&bitrate),
+        "usage: petplay-media capture-audio --stdin [LISTEN_ADDR] [--iroh-share] [--bitrate N]"
+    );
+    let bind = positional.first().map(String::as_str).unwrap_or("127.0.0.1:0").parse()?;
+    let transport = if share { Transport::Peer } else { Transport::Browser };
+    let mut publisher = AudioPublisher::new(bind, transport, bitrate)?;
+    println!("MOQ_READY listen={bind} fingerprint={}", publisher.fingerprint);
+    println!("AUDIO_SOURCE rate={RATE} channels={CHANNELS} codec=opus input=stdin");
+    let mut stdin = std::io::stdin().lock();
+    let mut bytes = vec![0u8; FRAME * CHANNELS * 4];
+    let mut samples = vec![0f32; FRAME * CHANNELS];
+    let start = Instant::now();
+    let (mut published, mut sent, mut reported) = (0u64, 0u64, Instant::now());
+    loop {
+        if let Err(e) = stdin.read_exact(&mut bytes) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+        for (sample, b) in samples.iter_mut().zip(bytes.chunks_exact(4)) {
+            *sample = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        }
+        sent += publisher.publish(&samples, start.elapsed().as_micros() as u64)? as u64;
+        published += 1;
+        if reported.elapsed() >= Duration::from_secs(5) {
+            println!(
+                "AUDIO_STATS packets={published} kbps={}",
+                sent * 8 / 1000 / reported.elapsed().as_secs().max(1)
+            );
+            sent = 0;
+            reported = Instant::now();
+        }
+    }
 }
 
 pub fn receive(args: &[std::ffi::OsString]) -> Result<()> {

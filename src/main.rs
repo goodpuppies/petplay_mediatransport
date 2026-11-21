@@ -77,10 +77,16 @@ fn main() -> Result<()> {
         );
     }
     if args.get(1).is_some_and(|a| a == "capture-audio") {
+        #[cfg(feature = "audio")]
+        if args[2..].iter().any(|a| a == "--stdin") {
+            return audio::capture_stdin(&args[2..]);
+        }
         #[cfg(all(feature = "capture-windows", target_os = "windows"))]
         return audio_windows::run(&args[2..]);
         #[cfg(not(all(feature = "capture-windows", target_os = "windows")))]
-        anyhow::bail!("capture-audio needs Windows and --features capture-windows (Linux: soon)");
+        anyhow::bail!(
+            "capture-audio captures on Windows (--features capture-windows); elsewhere pipe PCM to --stdin"
+        );
     }
     if args.get(1).is_some_and(|a| a == "receive-audio") {
         #[cfg(feature = "audio")]

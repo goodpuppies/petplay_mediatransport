@@ -23,6 +23,10 @@ mod source;
 mod web;
 #[cfg(all(feature = "decode-windows", target_os = "windows"))]
 mod windows_decode;
+#[cfg(all(feature = "capture-windows", target_os = "windows"))]
+mod windows_encode;
+#[cfg(all(feature = "capture-windows", target_os = "windows"))]
+mod wgc_source;
 #[cfg(all(feature = "decode-windows", target_os = "windows"))]
 mod windows_receive;
 use anyhow::Result;
@@ -43,6 +47,12 @@ fn main() -> Result<()> {
     #[cfg(all(feature = "decode-windows", target_os = "windows"))]
     if args.get(1).is_some_and(|a| a == "gpu-info") {
         return windows_decode::gpu_info();
+    }
+    if args.get(1).is_some_and(|a| a == "capture-wgc") {
+        #[cfg(all(feature = "capture-windows", target_os = "windows"))]
+        return wgc_source::run(&args[2..]);
+        #[cfg(not(all(feature = "capture-windows", target_os = "windows")))]
+        anyhow::bail!("capture-wgc needs Windows and --features capture-windows");
     }
     #[cfg(all(feature = "publish", target_os = "windows"))]
     if args.get(1).is_some_and(|a| a == "capture-tcp") {

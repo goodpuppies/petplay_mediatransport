@@ -126,6 +126,8 @@ impl Publisher {
     /// Publish the head pose the latest `frame` was rendered for, under the same timestamp.
     /// Payload (48 bytes): u64 BE microseconds as in `video`; then little-endian u64 client
     /// sequence, f32 rotation xyzw, f32 position xyz, u32 pose age at capture in microseconds.
+    /// Only the VA-API encoder (`encode`) has head poses to publish.
+    #[cfg(feature = "encode")]
     pub fn pose(&mut self, timestamp: u64, pose: &crate::source::Pose, age_us: u32) -> Result<()> {
         let Some(start) = self.start else { return Ok(()) };
         let micros = (timestamp - start) / 1000;

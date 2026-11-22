@@ -217,9 +217,18 @@ impl Decoder {
                 let buffer = sample.GetBufferByIndex(0)?;
                 let output_type = self.transform.GetOutputCurrentType(0)?;
                 let size = output_type.GetUINT64(&MF_MT_FRAME_SIZE)?;
+                let out_w = (size >> 32) as u32;
+                let out_h = size as u32;
+                // H.264 decoders (notably NVIDIA MF on 1080p -> 1088) may report macroblock-aligned
+                // coded dimensions while `convert()` crops to the catalog's visible `self.width x self.height`.
+                let coded_w = (self.width + 15) & !15;
+                let coded_h = (self.height + 15) & !15;
                 ensure!(
-                    (size >> 32) as u32 == self.width && size as u32 == self.height,
-                    "decoded geometry differs from catalog"
+                    (out_w == self.width || out_w == coded_w)
+                        && (out_h == self.height || out_h == coded_h),
+                    "decoded geometry {out_w}x{out_h} differs from catalog {}x{}",
+                    self.width,
+                    self.height,
                 );
                 let dxgi: IMFDXGIBuffer = buffer
                     .cast()
@@ -235,12 +244,18 @@ impl Decoder {
                     "decoder did not return a hardware decode surface"
                 );
                 let slice = dxgi.GetSubresourceIndex()?;
-                frames.push(self.convert(&texture, slice)?);
+                frames.push(self.convert(&texture, slice, desc.Width, desc.Height)?);
             }
             Ok(frames)
         }
     }
-    unsafe fn convert(&mut self, texture: &ID3D11Texture2D, slice: u32) -> Result<usize> {
+    unsafe fn convert(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        slice: u32,
+        input_width: u32,
+        input_height: u32,
+    ) -> Result<usize> {
         unsafe {
             let video: ID3D11VideoDevice = self.device.cast()?;
             let context: ID3D11VideoContext = self.context.cast()?;
@@ -251,8 +266,8 @@ impl Decoder {
                         Numerator: 60,
                         Denominator: 1,
                     },
-                    InputWidth: self.width,
-                    InputHeight: self.height,
+                    InputWidth: input_width,
+                    InputHeight: input_height,
                     OutputFrameRate: DXGI_RATIONAL {
                         Numerator: 60,
                         Denominator: 1,

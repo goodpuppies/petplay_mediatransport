@@ -15,10 +15,13 @@
 use crate::publish::{Format, Layout, Publisher, Transport};
 use crate::windows_encode::{Converter, Encoder, Event, Platform, Settings, device};
 use anyhow::{Context, Result, bail, ensure};
-use petplay_capture::windows::{Capture, monitors, use_physical_pixels};
+use petplay_capture::windows::{
+    Capture, focus_window, monitors, use_physical_pixels, windows as list_windows,
+};
+use serde_json::json;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: petplay-media capture-wgc --list\n   or: petplay-media capture-wgc MONITOR [LISTEN_ADDR] [--iroh-share] [--fps N] [--bitrate BITS_PER_SECOND] [--keyframe-seconds N] [--no-cursor]";
+const USAGE: &str = "usage: petplay-media capture-wgc --list | --list-windows | --focus-window HWND\n   or: petplay-media capture-wgc MONITOR|--window HWND [LISTEN_ADDR] [--iroh-share] [--fps N] [--bitrate BITS_PER_SECOND] [--keyframe-seconds N] [--no-cursor]";
 /// Repeats of the last picture once the screen goes still, a frame interval apart.
 const IDLE_REPEATS: u32 = 4;
 /// Then one repeat a second.
@@ -28,28 +31,70 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     use_physical_pixels();
     let mut positional = Vec::new();
     let (mut fps, mut bitrate, mut keyframe_seconds) = (30u32, 8_000_000u32, 1u32);
-    let (mut share, mut cursor, mut list) = (false, true, false);
+    let (mut share, mut cursor, mut list, mut list_win) = (false, true, false, false);
+    let mut window_hwnd: Option<isize> = None;
+    let mut focus_hwnd: Option<isize> = None;
     let mut rest = args.iter();
+    let parse_u32 = |rest: &mut std::slice::Iter<'_, std::ffi::OsString>, name: &str| -> Result<u32> {
+        rest.next()
+            .with_context(|| format!("{name} needs a value"))?
+            .to_str()
+            .context("non-UTF-8 option value")?
+            .parse()
+            .with_context(|| name.to_owned())
+    };
+    let parse_hwnd = |rest: &mut std::slice::Iter<'_, std::ffi::OsString>, name: &str| -> Result<isize> {
+        let raw = rest
+            .next()
+            .with_context(|| format!("{name} needs a value"))?
+            .to_str()
+            .context("non-UTF-8 option value")?;
+        if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            isize::from_str_radix(hex, 16).with_context(|| name.to_owned())
+        } else {
+            raw.parse().with_context(|| name.to_owned())
+        }
+    };
     while let Some(arg) = rest.next() {
         let text = arg.to_str().context("non-UTF-8 argument")?;
-        let mut value = |name: &str| -> Result<u32> {
-            rest.next()
-                .with_context(|| format!("{name} needs a value"))?
-                .to_str()
-                .context("non-UTF-8 option value")?
-                .parse()
-                .with_context(|| name.to_owned())
-        };
         match text {
             "--list" => list = true,
+            "--list-windows" => list_win = true,
+            "--window" => window_hwnd = Some(parse_hwnd(&mut rest, "--window")?),
+            "--focus-window" => focus_hwnd = Some(parse_hwnd(&mut rest, "--focus-window")?),
             "--iroh-share" => share = true,
             "--no-cursor" => cursor = false,
-            "--fps" => fps = value("--fps")?,
-            "--bitrate" => bitrate = value("--bitrate")?,
-            "--keyframe-seconds" => keyframe_seconds = value("--keyframe-seconds")?,
+            "--fps" => fps = parse_u32(&mut rest, "--fps")?,
+            "--bitrate" => bitrate = parse_u32(&mut rest, "--bitrate")?,
+            "--keyframe-seconds" => keyframe_seconds = parse_u32(&mut rest, "--keyframe-seconds")?,
             _ if text.starts_with("--") => bail!("unknown option {text}\n{USAGE}"),
             _ => positional.push(text.to_owned()),
         }
+    }
+    if let Some(hwnd) = focus_hwnd {
+        focus_window(hwnd);
+        return Ok(());
+    }
+    if list_win {
+        let items: Vec<_> = list_windows()
+            .into_iter()
+            .map(|w| {
+                json!({
+                    "id": format!("0x{:x}", w.handle as usize),
+                    "title": w.title,
+                    "app": w.app,
+                    "pid": w.pid,
+                    "x": w.x,
+                    "y": w.y,
+                    "width": w.width,
+                    "height": w.height,
+                    "minimized": w.minimized,
+                    "active": w.active,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(items));
+        return Ok(());
     }
     if list {
         for (index, monitor) in monitors().iter().enumerate() {
@@ -60,35 +105,50 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         }
         return Ok(());
     }
-    ensure!((1..=2).contains(&positional.len()), "{USAGE}");
     ensure!(
         (1..=240).contains(&fps)
             && (100_000..=200_000_000).contains(&bitrate)
             && (1..=60).contains(&keyframe_seconds),
         "fps, bitrate or keyframe interval out of range"
     );
-    let index: usize = positional[0].parse().context("MONITOR is an index from --list")?;
-    let monitor = monitors()
-        .into_iter()
-        .nth(index)
-        .with_context(|| format!("no monitor {index}; see capture-wgc --list"))?;
-    let bind = positional.get(1).map(String::as_str).unwrap_or("127.0.0.1:0").parse()?;
+    let (label, bind, target_window) = if let Some(hwnd) = window_hwnd {
+        ensure!(positional.len() <= 1, "{USAGE}");
+        let bind = positional.first().map(String::as_str).unwrap_or("127.0.0.1:0").parse()?;
+        (format!("window:0x{:x}", hwnd as usize), bind, Some(hwnd))
+    } else {
+        ensure!((1..=2).contains(&positional.len()), "{USAGE}");
+        let index: usize = positional[0].parse().context("MONITOR is an index from --list")?;
+        let monitor = monitors()
+            .into_iter()
+            .nth(index)
+            .with_context(|| format!("no monitor {index}; see capture-wgc --list"))?;
+        let bind = positional.get(1).map(String::as_str).unwrap_or("127.0.0.1:0").parse()?;
+        (monitor.name, bind, None)
+    };
 
     let _platform = Platform::new()?;
     let (device, context) = device()?;
-    let mut capture = Capture::start(&device, monitor.handle, cursor)
-        .context("start Windows Graphics Capture")?;
-    // Windows sends the monitor's current picture as soon as capture starts.
+    let mut capture = if let Some(hwnd) = target_window {
+        Capture::start_window(&device, hwnd, cursor).context("start Windows Graphics Capture (window)")?
+    } else {
+        let index: usize = positional[0].parse()?;
+        let monitor = monitors()
+            .into_iter()
+            .nth(index)
+            .with_context(|| format!("no monitor {index}"))?;
+        Capture::start(&device, monitor.handle, cursor).context("start Windows Graphics Capture")?
+    };
+    // Windows sends the target's current picture as soon as capture starts.
     let deadline = Instant::now() + Duration::from_secs(5);
     let first = loop {
         if let Some(frame) = capture.next_frame(Duration::from_millis(100))? {
             break frame;
         }
-        ensure!(Instant::now() < deadline, "no picture from {} within 5 s", monitor.name);
+        ensure!(Instant::now() < deadline, "no picture from {} within 5 s", label);
     };
-    // NV12 needs even dimensions: an odd monitor loses its last row or column.
+    // NV12 needs even dimensions: an odd capture loses its last row or column.
     let (width, height) = (first.width & !1, first.height & !1);
-    ensure!(width >= 16 && height >= 16, "monitor too small: {}x{}", first.width, first.height);
+    ensure!(width >= 16 && height >= 16, "target too small: {}x{}", first.width, first.height);
     let mut converter = Converter::new(&device, &context, width, height)?;
     let mut encoder = Encoder::new(
         &device,
@@ -97,7 +157,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
     let mut publisher = Publisher::new(bind, if share { Transport::Peer } else { Transport::Browser })?;
     println!("MOQ_READY listen={bind} fingerprint={}", publisher.fingerprint);
     publisher.describe(Format { width, height, framerate: fps, layout: Layout::Mono });
-    println!("MEDIA_SOURCE width={width} height={height} fps={fps} layout=Mono monitor={:?}", monitor.name);
+    println!("MEDIA_SOURCE width={width} height={height} fps={fps} layout=Mono monitor={:?}", label);
 
     let start = Instant::now();
     let ticks = |at: Instant| (at - start).as_nanos() as i64 / 100;
@@ -160,7 +220,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             ensure!(
                 frame.width & !1 == width && frame.height & !1 == height,
                 "{} changed resolution to {}x{}; restart the capture",
-                monitor.name,
+                label,
                 frame.width,
                 frame.height
             );

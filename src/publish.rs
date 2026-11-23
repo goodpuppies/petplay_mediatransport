@@ -70,6 +70,8 @@ pub struct Publisher {
     /// Head pose each frame was rendered for; one group per video group.
     pose: track::Producer,
     pose_group: Option<(u64, group::Producer)>,
+    /// Optional WebRTC H.264 publisher for plain-HTTP browsers.
+    webrtc: crate::webrtc::WebRtcHub,
 }
 #[cfg(any(feature = "encode", feature = "publish"))]
 impl Publisher {
@@ -102,6 +104,7 @@ impl Publisher {
         broadcast.announce(Default::default())?;
         // The share code reaches callers on stdout, like the other readiness lines.
         let (fingerprint, _share_code) = serve(&runtime, origin.consume(), bind, transport)?;
+        let (webrtc, _webrtc_signal) = crate::webrtc::WebRtcHub::start(&runtime, bind.ip())?;
         drop(_enter);
         Ok(Self {
             fingerprint,
@@ -116,6 +119,7 @@ impl Publisher {
             format: None,
             pose,
             pose_group: None,
+            webrtc,
         })
     }
     /// Record the source geometry. The producer's first descriptor decides it, so this
@@ -184,6 +188,7 @@ impl Publisher {
         data.push(u8::from(key));
         data.extend_from_slice(&micros.to_be_bytes());
         data.extend_from_slice(bytes);
+        self.webrtc.push(bytes, key, micros);
         self.group
             .as_mut()
             .unwrap()

@@ -26,6 +26,8 @@ mod receive_output;
 #[cfg(feature = "encode")]
 mod source;
 mod web;
+#[cfg(any(feature = "encode", feature = "publish"))]
+mod webrtc;
 #[cfg(all(feature = "decode-windows", target_os = "windows"))]
 mod windows_decode;
 #[cfg(all(feature = "capture-windows", target_os = "windows"))]

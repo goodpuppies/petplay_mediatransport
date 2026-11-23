@@ -394,6 +394,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
 
     let bind: std::net::SocketAddr = listen.parse().context("parse listen address")?;
     let mut publisher = publish::Publisher::new(bind, transport)?;
+    println!("MOQ_READY listen={bind} fingerprint={}", publisher.fingerprint);
     publisher.describe(publish::Format {
         width: atlas_w,
         height: atlas_h,

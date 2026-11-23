@@ -194,6 +194,24 @@ impl Processor {
 		D: SurfaceMemoryDescriptor,
 		E: SurfaceMemoryDescriptor,
 	{
+		self.blit_region(input, output, None, input_color, output_color)
+	}
+
+	/// Blits `input` into a sub-rectangle `(x, y, width, height)` of `output` (or the whole
+	/// surface when `output_region` is `None`), leaving pixels outside the region untouched
+	/// (`output_background_color` alpha = 0).
+	pub fn blit_region<D, E>(
+		&self,
+		input: &Surface<D>,
+		output: &Surface<E>,
+		output_region: Option<(i16, i16, u16, u16)>,
+		input_color: Option<Color>,
+		output_color: Option<Color>,
+	) -> anyhow::Result<()>
+	where
+		D: SurfaceMemoryDescriptor,
+		E: SurfaceMemoryDescriptor,
+	{
 		// A surface id means something only on the display that made it, and
 		// the driver would read another display's id as one of its own.
 		if !Arc::ptr_eq(input.display(), &self.display) || !Arc::ptr_eq(output.display(), &self.display) {
@@ -201,7 +219,8 @@ impl Processor {
 		}
 		let size = output.size();
 		let context = self.context(size)?;
-		let parameters = pipeline(input.id(), self.colors, input_color, output_color);
+		let region = output_region.map(|(x, y, width, height)| bindings::VARectangle { x, y, width, height });
+		let parameters = pipeline(input.id(), self.colors, input_color, output_color, region);
 		let result = run_blit(&context, output, parameters);
 		if result.is_err() {
 			// A picture that failed half way can leave the context mid-picture,
@@ -366,6 +385,7 @@ fn pipeline(
 	colors: Colors,
 	input_color: Option<Color>,
 	output_color: Option<Color>,
+	output_region: Option<bindings::VARectangle>,
 ) -> ProcPipelineParameterBuffer {
 	let named = input_color.is_some() || output_color.is_some();
 	let side = |color: Option<Color>| match (colors, color) {
@@ -388,7 +408,7 @@ fn pipeline(
 		surface,
 		None,
 		input_standard,
-		None,
+		output_region,
 		0,
 		output_standard,
 		0,

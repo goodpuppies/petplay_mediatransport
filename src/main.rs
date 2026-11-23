@@ -1,6 +1,8 @@
 //! Native media worker. Only DMA-BUF descriptors and encoded bytes cross CPU memory.
 #[cfg(feature = "publish")]
 mod annexb_source;
+#[cfg(all(feature = "encode", target_os = "linux"))]
+mod atlas;
 #[cfg(feature = "audio")]
 mod audio;
 #[cfg(all(feature = "capture-windows", target_os = "windows"))]
@@ -101,6 +103,12 @@ fn main() -> Result<()> {
         return link::run(&args[2..]);
         #[cfg(not(feature = "iroh"))]
         anyhow::bail!("link needs --features iroh");
+    }
+    if args.get(1).is_some_and(|a| a == "atlas") {
+        #[cfg(all(feature = "encode", target_os = "linux"))]
+        return atlas::run(&args[2..]);
+        #[cfg(not(all(feature = "encode", target_os = "linux")))]
+        anyhow::bail!("atlas needs Linux and --features encode");
     }
     if args.get(1).is_some_and(|a| a == "gateway") {
         return gateway::run(&args[2..]);

@@ -416,6 +416,39 @@ impl Encoder {
 		result
 	}
 
+	/// Blits an imported DMA-BUF into a sub-rectangle `(x, y, width, height)` of the encoder's
+	/// persistent NV12 input surface without encoding yet. Used by GPU atlas composition.
+	pub fn blit_dmabuf_region(
+		&mut self,
+		buffer: DmaBuf,
+		region: (i16, i16, u16, u16),
+	) -> anyhow::Result<()> {
+		let fourcc = buffer
+			.fourcc()
+			.ok_or_else(|| anyhow::anyhow!("no VA-API format for DRM format {:#010x}", buffer.drm_format))?;
+		let color = self.config.color;
+		let input_color = match is_rgb(fourcc) {
+			true => None,
+			false => Some(buffer.color.unwrap_or(color)),
+		};
+		let source = buffer.import(&self.display, Some(UsageHint::USAGE_HINT_VPP_READ))?;
+		let input = self.input.take().expect("input surface present");
+		let result = self
+			.processor()
+			.and_then(|processor| processor.blit_region(&source, &input, Some(region), input_color, Some(color)));
+		self.input = Some(input);
+		result
+	}
+
+	/// Encodes the encoder's persistent NV12 input surface (previously populated via
+	/// [`blit_dmabuf_region`](Self::blit_dmabuf_region)).
+	pub fn encode_input(&mut self, keyframe: bool) -> anyhow::Result<Vec<u8>> {
+		let input = self.input.take().expect("input surface present");
+		let result = self.encode_surface(&input, keyframe);
+		self.input = Some(input);
+		result
+	}
+
 	/// Changes the target bitrate, in bits per second, from the next frame on.
 	///
 	/// The rate control parameters go out with every frame, so this neither

@@ -57,7 +57,24 @@ struct AtlasEntry {
     webrtc_hub: webrtc::WebRtcHub,
     runtime: tokio::runtime::Handle,
     cmd_tx: mpsc::Sender<atlas::AtlasCmd>,
+    slot_sockets: HashMap<String, String>,
+    slot_seq: u64,
     join: Option<JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "encode", target_os = "linux"))]
+fn runtime_socket_dir() -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::geteuid() }));
+    PathBuf::from(base).join(format!("petplay-media-{}", std::process::id()))
+}
+
+#[cfg(all(feature = "encode", target_os = "linux"))]
+fn sanitize_filename(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(48)
+        .collect()
 }
 
 #[cfg(all(feature = "encode", target_os = "linux"))]
@@ -79,9 +96,12 @@ pub fn run() -> Result<()> {
             Arc::new(Mutex::new(HashMap::new()));
         let atlases: Arc<Mutex<HashMap<String, AtlasEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let sock_dir = Arc::new(runtime_socket_dir());
+        let _ = std::fs::create_dir_all(&*sock_dir);
 
         {
             let feeds = Arc::clone(&feeds);
+            let sock_dir = Arc::clone(&sock_dir);
             actor.on("START_SOCKET_FEED", move |ctx, payload| {
                 let id = payload
                     .get("id")
@@ -91,8 +111,14 @@ pub fn run() -> Result<()> {
                 let socket_path = payload
                     .get("socketPath")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "START_SOCKET_FEED needs {socketPath}".to_owned())?
-                    .to_owned();
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        sock_dir
+                            .join(format!("feed-{}.sock", sanitize_filename(&id)))
+                            .to_string_lossy()
+                            .into_owned()
+                    });
                 let host = payload
                     .get("host")
                     .and_then(Value::as_str)
@@ -368,6 +394,8 @@ pub fn run() -> Result<()> {
                         webrtc_hub,
                         runtime,
                         cmd_tx,
+                        slot_sockets: HashMap::new(),
+                        slot_seq: 0,
                         join: Some(join),
                     },
                 );
@@ -388,6 +416,7 @@ pub fn run() -> Result<()> {
 
         {
             let atlases = Arc::clone(&atlases);
+            let sock_dir = Arc::clone(&sock_dir);
             actor.on("ATLAS_ADD", move |_ctx, payload| {
                 let id = payload
                     .get("id")
@@ -396,24 +425,40 @@ pub fn run() -> Result<()> {
                 let slot_id = payload
                     .get("slotId")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "ATLAS_ADD needs {slotId, socketPath}".to_owned())?
+                    .ok_or_else(|| "ATLAS_ADD needs {slotId}".to_owned())?
                     .to_owned();
-                let socket_path = payload
+                let requested_path = payload
                     .get("socketPath")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "ATLAS_ADD needs {slotId, socketPath}".to_owned())?;
-                let map = atlases.lock().unwrap();
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let mut map = atlases.lock().unwrap();
                 let entry = map
-                    .get(id)
+                    .get_mut(id)
                     .ok_or_else(|| format!("unknown atlas {id}"))?;
+                if let Some(existing) = entry.slot_sockets.get(&slot_id) {
+                    return Ok(json!({ "slotId": slot_id, "socketPath": existing }));
+                }
+                entry.slot_seq += 1;
+                let socket_path = requested_path.unwrap_or_else(|| {
+                    sock_dir
+                        .join(format!("atlas-{}-{}.sock", sanitize_filename(id), entry.slot_seq))
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                // Bind synchronously before replying so producers can connect immediately with no sleep.
+                let (listener, guard) = atlas::bind_slot_socket(&PathBuf::from(&socket_path))
+                    .map_err(|e| format!("bind atlas slot socket {socket_path}: {e:#}"))?;
                 entry
                     .cmd_tx
-                    .send(atlas::AtlasCmd::Add {
-                        id: slot_id,
-                        socket_path: PathBuf::from(socket_path),
+                    .send(atlas::AtlasCmd::AddBound {
+                        id: slot_id.clone(),
+                        listener,
+                        guard,
                     })
                     .map_err(|_| format!("atlas {id} channel closed"))?;
-                Ok(Value::Bool(true))
+                entry.slot_sockets.insert(slot_id.clone(), socket_path.clone());
+                Ok(json!({ "slotId": slot_id, "socketPath": socket_path }))
             });
         }
 
@@ -429,13 +474,86 @@ pub fn run() -> Result<()> {
                     .and_then(Value::as_str)
                     .ok_or_else(|| "ATLAS_REMOVE needs {slotId}".to_owned())?
                     .to_owned();
-                let map = atlases.lock().unwrap();
-                if let Some(entry) = map.get(id) {
+                let mut map = atlases.lock().unwrap();
+                if let Some(entry) = map.get_mut(id) {
+                    entry.slot_sockets.remove(&slot_id);
                     let _ = entry.cmd_tx.send(atlas::AtlasCmd::Remove { id: slot_id });
                 }
                 Ok(Value::Bool(true))
             });
         }
+
+        // StageForge Transport protocol: negotiate `dmabuf-seqpacket` for `purpose: "media.frames"`.
+        {
+            let feeds = Arc::clone(&feeds);
+            let atlases = Arc::clone(&atlases);
+            actor.on("TRANSPORTOFFER", move |ctx, payload| {
+                let transport_id = payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "TRANSPORTOFFER missing id".to_owned())?;
+                let from = payload
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .unwrap_or(ctx.sender);
+                let purpose = payload
+                    .get("purpose")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if purpose != "media.frames" {
+                    return Err(format!("unsupported transport purpose: {purpose}"));
+                }
+                let offers_seqpacket = payload
+                    .get("kinds")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.iter().any(|k| {
+                            k.get("kind").and_then(Value::as_str) == Some("dmabuf-seqpacket")
+                        })
+                    });
+                if !offers_seqpacket {
+                    return Err("no compatible transport kind (expected dmabuf-seqpacket)".to_owned());
+                }
+                let params = payload.get("params");
+                let socket_path = if let Some(feed_id) = params.and_then(|p| p.get("feedId")).and_then(Value::as_str) {
+                    feeds
+                        .lock()
+                        .unwrap()
+                        .get(feed_id)
+                        .map(|e| e.socket_path.clone())
+                        .ok_or_else(|| format!("unknown feedId {feed_id}"))?
+                } else if let (Some(atlas_id), Some(slot_id)) = (
+                    params.and_then(|p| p.get("atlasId")).and_then(Value::as_str),
+                    params.and_then(|p| p.get("slotId")).and_then(Value::as_str),
+                ) {
+                    atlases
+                        .lock()
+                        .unwrap()
+                        .get(atlas_id)
+                        .and_then(|a| a.slot_sockets.get(slot_id).cloned())
+                        .ok_or_else(|| format!("unknown atlas slot {atlas_id}/{slot_id}"))?
+                } else {
+                    return Err("dmabuf-seqpacket requires params.feedId or params.{atlasId,slotId}".to_owned());
+                };
+
+                // Emit the bound socket descriptor over TRANSPORTSIGNAL immediately (StageForge
+                // buffers signals before TRANSPORTOFFER resolves, so zero extra RTT).
+                let _ = ctx.handle.post(
+                    from,
+                    "TRANSPORTSIGNAL",
+                    json!({
+                        "id": transport_id,
+                        "data": { "socketPath": socket_path },
+                    }),
+                );
+                Ok(json!({
+                    "kind": "dmabuf-seqpacket",
+                    "listener": "responder",
+                }))
+            });
+        }
+
+        actor.on("TRANSPORTCANCEL", |_ctx, _payload| Ok(Value::Bool(true)));
 
         {
             let feeds = Arc::clone(&feeds);
@@ -545,6 +663,7 @@ pub fn run() -> Result<()> {
         {
             let feeds = Arc::clone(&feeds);
             let atlases = Arc::clone(&atlases);
+            let sock_dir = Arc::clone(&sock_dir);
             actor.on_shutdown(move || {
                 let drained: Vec<SocketFeedEntry> =
                     feeds.lock().unwrap().drain().map(|(_, v)| v).collect();
@@ -556,6 +675,7 @@ pub fn run() -> Result<()> {
                 for mut entry in drained_atlases {
                     entry.stop_and_join();
                 }
+                let _ = std::fs::remove_dir_all(&*sock_dir);
             });
         }
     }

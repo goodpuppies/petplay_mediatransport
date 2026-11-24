@@ -96,7 +96,7 @@ fn wait_ready(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-struct SocketPath {
+pub struct SocketPath {
     path: PathBuf,
     inode: u64,
 }
@@ -106,6 +106,13 @@ impl Drop for SocketPath {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+pub fn bind_slot_socket(path: &Path) -> Result<(OwnedFd, SocketPath)> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    listen_seqpacket(path)
 }
 
 fn listen_seqpacket(path: &Path) -> Result<(OwnedFd, SocketPath)> {
@@ -203,6 +210,7 @@ struct SlotHandle {
 
 pub enum AtlasCmd {
     Add { id: String, socket_path: PathBuf },
+    AddBound { id: String, listener: OwnedFd, guard: SocketPath },
     Remove { id: String },
     Quit,
 }
@@ -213,6 +221,16 @@ fn spawn_slot_reader(
     latest: Arc<Mutex<Option<PendingFrame>>>,
 ) -> Result<()> {
     let (listener, guard) = listen_seqpacket(&socket_path)?;
+    spawn_slot_reader_bound(listener, guard, stop, latest);
+    Ok(())
+}
+
+fn spawn_slot_reader_bound(
+    listener: OwnedFd,
+    guard: SocketPath,
+    stop: Arc<AtomicBool>,
+    latest: Arc<Mutex<Option<PendingFrame>>>,
+) {
     thread::spawn(move || {
         let _guard = guard;
         while !stop.load(Ordering::Relaxed) {
@@ -306,7 +324,6 @@ fn spawn_slot_reader(
             }
         }
     });
-    Ok(())
 }
 
 fn grid_dims(n: usize) -> (u32, u32) {
@@ -480,6 +497,24 @@ pub fn run_atlas_loop(
                         eprintln!("ATLAS_SLOT_ERROR {id}: {err:#}");
                         continue;
                     }
+                    index_by_id.insert(id.clone(), slots.len());
+                    slots.push(SlotHandle {
+                        id,
+                        stop,
+                        latest,
+                        src_w: 1280,
+                        src_h: 720,
+                        rect: (0, 0, 1280, 720),
+                    });
+                    layout_dirty = true;
+                }
+                AtlasCmd::AddBound { id, listener, guard } => {
+                    if index_by_id.contains_key(&id) {
+                        continue;
+                    }
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let latest = Arc::new(Mutex::new(None));
+                    spawn_slot_reader_bound(listener, guard, Arc::clone(&stop), Arc::clone(&latest));
                     index_by_id.insert(id.clone(), slots.len());
                     slots.push(SlotHandle {
                         id,

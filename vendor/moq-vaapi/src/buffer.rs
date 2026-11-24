@@ -39,6 +39,9 @@ use crate::VaError;
 pub struct Buffer {
 	context: Rc<Context>,
 	id: bindings::VABufferID,
+	/// Keeps heap allocations referenced by raw pointers inside `VAProcPipelineParameterBuffer`
+	/// (such as `output_region` / `surface_region`) alive until after `vaRenderPicture` + `vaDestroyBuffer`.
+	_proc_pipeline: Option<proc_pipeline::ProcPipelineParameterBuffer>,
 }
 
 impl Buffer {
@@ -311,7 +314,16 @@ impl Buffer {
 			)
 		})?;
 
-		Ok(Self { context, id: buffer_id })
+		let _proc_pipeline = match type_ {
+			BufferType::ProcPipelineParameter(p) => Some(p),
+			_ => None,
+		};
+
+		Ok(Self {
+			context,
+			id: buffer_id,
+			_proc_pipeline,
+		})
 	}
 
 	/// Convenience function to return a `VABufferID` vector from a slice of `Buffer`s in order to

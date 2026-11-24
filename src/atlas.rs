@@ -405,6 +405,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
     let mut cfg = Config::new(atlas_w, atlas_h, fps, bitrate, fps * 2);
     cfg.device = Some("/dev/dri/renderD128".into());
     let mut encoder = Encoder::new(cfg).context("atlas VA-API H.264 encoder")?;
+    let _ = encoder.clear_input_black();
     println!("MEDIA_READY");
     println!("MEDIA_SOURCE width={atlas_w} height={atlas_h} fps={fps} layout=Mono");
 
@@ -496,6 +497,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         }
 
         if layout_dirty {
+            let _ = encoder.clear_input_black();
             let json = recompute_layout(&mut slots, atlas_w, atlas_h);
             println!("ATLAS_LAYOUT {json}");
         }

@@ -440,6 +440,33 @@ impl Encoder {
 		result
 	}
 
+	/// Fills the persistent NV12 input surface with solid black (Y=16, UV=128) so unused atlas
+	/// regions never show uninitialized all-zero (green) chroma.
+	pub fn clear_input_black(&mut self) -> anyhow::Result<()> {
+		let input = self.input.as_ref().expect("input surface present");
+		let (w, h) = (self.config.width, self.config.height);
+		let fmt = self
+			.display
+			.query_image_formats()
+			.map_err(|e| anyhow::anyhow!("query_image_formats: {e:?}"))?
+			.into_iter()
+			.find(|f| f.fourcc == crate::bindings::VA_FOURCC_NV12)
+			.ok_or_else(|| anyhow::anyhow!("NV12 image format unavailable"))?;
+		let mut img = crate::Image::create_from(input, fmt, (w, h), (w, h))
+			.map_err(|e| anyhow::anyhow!("create_from NV12: {e:?}"))?;
+		let vi = *img.image();
+		let data = img.as_mut();
+		for y in 0..h as usize {
+			let row = vi.offsets[0] as usize + y * vi.pitches[0] as usize;
+			data[row..row + w as usize].fill(16);
+		}
+		for y in 0..(h as usize / 2) {
+			let row = vi.offsets[1] as usize + y * vi.pitches[1] as usize;
+			data[row..row + w as usize].fill(128);
+		}
+		Ok(())
+	}
+
 	/// Encodes the encoder's persistent NV12 input surface (previously populated via
 	/// [`blit_dmabuf_region`](Self::blit_dmabuf_region)).
 	pub fn encode_input(&mut self, keyframe: bool) -> anyhow::Result<Vec<u8>> {

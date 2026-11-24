@@ -619,4 +619,52 @@ mod tests {
 			"one free surface is kept per size, and the other destroyed"
 		);
 	}
+
+	#[test]
+	fn blit_region_writes_subrect_pixels() {
+		let Some(display) = Display::open() else {
+			eprintln!("skipping: no VA-API display");
+			return;
+		};
+		let Ok(processor) = Processor::with_display(display.clone()) else {
+			eprintln!("skipping: no VPP");
+			return;
+		};
+		let src = split_surface(&processor, (640, 480), [80, 200]);
+		let dst = display
+			.create_surfaces(
+				VA_RT_FORMAT_YUV420,
+				Some(VA_FOURCC_NV12),
+				1280,
+				720,
+				Some(UsageHint::USAGE_HINT_VPP_WRITE | UsageHint::USAGE_HINT_EXPORT),
+				vec![()],
+			)
+			.expect("dst surface")
+			.pop()
+			.unwrap();
+		processor
+			.blit_region(&src, &dst, Some((0, 0, 640, 480)), None, None)
+			.expect("blit_region");
+		let fmt = display
+			.query_image_formats()
+			.unwrap()
+			.into_iter()
+			.find(|f| f.fourcc == VA_FOURCC_NV12)
+			.unwrap();
+		let img = crate::Image::create_from(&dst, fmt, (1280, 720), (1280, 720)).expect("image");
+		let vi = *img.image();
+		let data = img.as_ref();
+		let y_left = data[vi.offsets[0] as usize + 240 * vi.pitches[0] as usize + 160];
+		let y_right = data[vi.offsets[0] as usize + 240 * vi.pitches[0] as usize + 480];
+		let y_out = data[vi.offsets[0] as usize + 240 * vi.pitches[0] as usize + 960];
+		let uv_in_u = data[vi.offsets[1] as usize + 120 * vi.pitches[1] as usize + 160];
+		let uv_in_v = data[vi.offsets[1] as usize + 120 * vi.pitches[1] as usize + 161];
+		let uv_out_u = data[vi.offsets[1] as usize + 120 * vi.pitches[1] as usize + 960];
+		let uv_out_v = data[vi.offsets[1] as usize + 120 * vi.pitches[1] as usize + 961];
+		eprintln!(
+			"blit_region NV12->NV12: y_left={y_left} y_right={y_right} y_out={y_out} uv_in=({uv_in_u},{uv_in_v}) uv_out=({uv_out_u},{uv_out_v})"
+		);
+		assert!(y_left.abs_diff(80) < 10 && y_right.abs_diff(200) < 10, "expected [80, 200], got [{y_left}, {y_right}]");
+	}
 }

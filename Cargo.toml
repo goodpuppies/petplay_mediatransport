@@ -23,7 +23,7 @@ opus = { version = "0.4", optional = true }
 cpal = { version = "0.15", optional = true }
 
 [features]
-default = ["decode"]
+default = ["encode", "decode"]
 # The GPU encoder and its DMA-BUF ingestion need a VA-API device. A viewer-only build
 # (the `gateway` subcommand) drops them, which is what a non-Linux receiver needs.
 encode = ["moq-vaapi"]

@@ -39,7 +39,40 @@ mod wgc_source;
 #[cfg(all(feature = "decode-windows", target_os = "windows"))]
 mod windows_receive;
 use anyhow::Result;
+/// Set by a parent that holds this process's stdin open for its own lifetime (PetPlay's
+/// `petplayMediaCommand`). EOF on stdin then means the parent is gone, however it went
+/// (Ctrl-C mid-teardown, crash, SIGKILL), so exit instead of holding ports and the GPU.
+/// Modes that read data from stdin (`atlas`, `capture-audio --stdin`, `receive --stdio`)
+/// must not be spawned with it.
+const EXIT_WITH_PARENT_ENV: &str = "PETPLAY_MEDIA_EXIT_WITH_PARENT";
+
+fn exit_with_parent() {
+    if std::env::var_os(EXIT_WITH_PARENT_ENV).is_none() {
+        return;
+    }
+    std::thread::spawn(|| {
+        use std::io::{Read, Write};
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 64];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    // Not eprintln!: stderr is usually a pipe into the dead parent, and
+                    // eprintln! panics on EPIPE, which would kill only this thread.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "petplay-media: parent gone (stdin closed), exiting"
+                    );
+                    std::process::exit(0);
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
+    exit_with_parent();
     let args: Vec<_> = std::env::args_os().collect();
     #[cfg(all(feature = "decode-windows", target_os = "windows"))]
     if args.get(1).is_some_and(|a| a == "decode-test") {

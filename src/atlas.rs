@@ -201,7 +201,7 @@ struct SlotHandle {
     rect: (i16, i16, u16, u16),
 }
 
-enum AtlasCmd {
+pub enum AtlasCmd {
     Add { id: String, socket_path: PathBuf },
     Remove { id: String },
     Quit,
@@ -393,21 +393,8 @@ pub fn run(args: &[OsString]) -> Result<()> {
     atlas_h = (atlas_h & !1).max(240);
 
     let bind: std::net::SocketAddr = listen.parse().context("parse listen address")?;
-    let mut publisher = publish::Publisher::new(bind, transport)?;
+    let publisher = publish::Publisher::new(bind, transport)?;
     println!("MOQ_READY listen={bind} fingerprint={}", publisher.fingerprint);
-    publisher.describe(publish::Format {
-        width: atlas_w,
-        height: atlas_h,
-        framerate: fps,
-        layout: publish::Layout::Mono,
-    });
-
-    let mut cfg = Config::new(atlas_w, atlas_h, fps, bitrate, fps * 2);
-    cfg.device = Some("/dev/dri/renderD128".into());
-    let mut encoder = Encoder::new(cfg).context("atlas VA-API H.264 encoder")?;
-    let _ = encoder.clear_input_black();
-    println!("MEDIA_READY");
-    println!("MEDIA_SOURCE width={atlas_w} height={atlas_h} fps={fps} layout=Mono");
 
     let (tx, rx) = mpsc::channel::<AtlasCmd>();
     thread::spawn(move || {
@@ -429,6 +416,48 @@ pub fn run(args: &[OsString]) -> Result<()> {
         }
         let _ = tx.send(AtlasCmd::Quit);
     });
+
+    run_atlas_loop(
+        atlas_w,
+        atlas_h,
+        fps,
+        bitrate,
+        publisher,
+        rx,
+        true,
+        |layout_json| {
+            println!("ATLAS_LAYOUT {layout_json}");
+        },
+    )
+}
+
+/// Shared GPU atlas composition loop used by both `petplay-media atlas` and `petplay-media actor`.
+/// When `announce_stdout` is false (actor mode), nothing is written to stdout.
+pub fn run_atlas_loop(
+    atlas_w: u32,
+    atlas_h: u32,
+    fps: u32,
+    bitrate: u32,
+    mut publisher: publish::Publisher,
+    rx: mpsc::Receiver<AtlasCmd>,
+    announce_stdout: bool,
+    mut on_layout: impl FnMut(&str),
+) -> Result<()> {
+    publisher.describe(publish::Format {
+        width: atlas_w,
+        height: atlas_h,
+        framerate: fps,
+        layout: publish::Layout::Mono,
+    });
+
+    let mut cfg = Config::new(atlas_w, atlas_h, fps, bitrate, fps * 2);
+    cfg.device = Some("/dev/dri/renderD128".into());
+    let mut encoder = Encoder::new(cfg).context("atlas VA-API H.264 encoder")?;
+    let _ = encoder.clear_input_black();
+    if announce_stdout {
+        println!("MEDIA_READY");
+        println!("MEDIA_SOURCE width={atlas_w} height={atlas_h} fps={fps} layout=Mono");
+    }
 
     let mut slots: Vec<SlotHandle> = Vec::new();
     let mut index_by_id: HashMap<String, usize> = HashMap::new();
@@ -499,7 +528,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         if layout_dirty {
             let _ = encoder.clear_input_black();
             let json = recompute_layout(&mut slots, atlas_w, atlas_h);
-            println!("ATLAS_LAYOUT {json}");
+            on_layout(&json);
         }
 
         // Blit every updated slot into the persistent NV12 atlas surface.

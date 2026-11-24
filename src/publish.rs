@@ -58,6 +58,7 @@ pub enum Transport {
 #[cfg(any(feature = "encode", feature = "publish"))]
 pub struct Publisher {
     pub fingerprint: String,
+    pub share_code: Option<String>,
     _runtime: tokio::runtime::Runtime,
     _origin: origin::Producer,
     _broadcast: broadcast::Producer,
@@ -76,6 +77,17 @@ pub struct Publisher {
 #[cfg(any(feature = "encode", feature = "publish"))]
 impl Publisher {
     pub fn new(bind: SocketAddr, transport: Transport) -> Result<Self> {
+        Self::new_inner(bind, transport, false)
+    }
+
+    /// Quiet variant for StageForge actor mode: writes nothing to stdout and skips the loopback
+    /// HTTP signaling server (offers arrive via `webrtc_hub().accept_offer(...)`).
+    #[allow(dead_code)]
+    pub fn new_for_actor(bind: SocketAddr, transport: Transport) -> Result<Self> {
+        Self::new_inner(bind, transport, true)
+    }
+
+    fn new_inner(bind: SocketAddr, transport: Transport, quiet: bool) -> Result<Self> {
         let threads = std::env::var("PETPLAY_PUBLISH_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -102,12 +114,16 @@ impl Publisher {
                 .with_max_age(Duration::from_secs(1)),
         )?;
         broadcast.announce(Default::default())?;
-        // The share code reaches callers on stdout, like the other readiness lines.
-        let (fingerprint, _share_code) = serve(&runtime, origin.consume(), bind, transport)?;
-        let (webrtc, _webrtc_signal) = crate::webrtc::WebRtcHub::start(&runtime, bind.ip())?;
+        let (fingerprint, share_code) = serve_inner(&runtime, origin.consume(), bind, transport, quiet)?;
+        let webrtc = if quiet {
+            crate::webrtc::WebRtcHub::new(bind.ip())
+        } else {
+            crate::webrtc::WebRtcHub::start(&runtime, bind.ip())?.0
+        };
         drop(_enter);
         Ok(Self {
             fingerprint,
+            share_code,
             _runtime: runtime,
             _origin: origin,
             _broadcast: broadcast,
@@ -121,6 +137,16 @@ impl Publisher {
             pose_group: None,
             webrtc,
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn webrtc_hub(&self) -> crate::webrtc::WebRtcHub {
+        self.webrtc.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self._runtime.handle().clone()
     }
     /// Record the source geometry. The producer's first descriptor decides it, so this
     /// runs once the encoder exists and always before the first published frame.
@@ -204,6 +230,16 @@ pub fn serve(
     bind: SocketAddr,
     transport: Transport,
 ) -> Result<(String, Option<String>)> {
+    serve_inner(runtime, origin, bind, transport, false)
+}
+
+fn serve_inner(
+    runtime: &tokio::runtime::Runtime,
+    origin: origin::Consumer,
+    bind: SocketAddr,
+    transport: Transport,
+    quiet: bool,
+) -> Result<(String, Option<String>)> {
     let mut listen = moq_tokio::listen::Config::default();
     listen.bind = Some(moq_tokio::listen::Bind::Addr(bind));
     listen.tls.generate = vec!["localhost".into(), "127.0.0.1".into()];
@@ -214,12 +250,16 @@ pub fn serve(
     if let Ok(family) = std::env::var("MOQ_QUIC_CONGESTION_CONTROL") {
         config.quic.congestion_control =
             Some(family.parse().map_err(|e: String| anyhow::anyhow!(e))?);
-        println!("QUIC_CONGESTION_CONTROL {family}");
+        if !quiet {
+            println!("QUIC_CONGESTION_CONTROL {family}");
+        }
     }
     // One qlog file per connection into this existing directory (needs the `qlog` feature).
     if let Some(dir) = std::env::var_os("MOQ_QUIC_QLOG") {
         config.quic.qlog = Some(dir.into());
-        println!("QUIC_QLOG enabled");
+        if !quiet {
+            println!("QUIC_QLOG enabled");
+        }
     }
     let mut share_code = None;
     if transport != Transport::Browser {
@@ -236,9 +276,11 @@ pub fn serve(
                     &endpoint,
                     std::time::Duration::from_secs(15),
                 ))?;
-                println!("IROH_SHARE code={code}");
+                if !quiet {
+                    println!("IROH_SHARE code={code}");
+                }
                 share_code = Some(code);
-            } else {
+            } else if !quiet {
                 println!(
                     "IROH_READY id={} address={}",
                     endpoint.id(),

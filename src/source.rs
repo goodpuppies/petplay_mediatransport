@@ -38,7 +38,7 @@ fn syscall(n: libc::c_int, what: &str) -> Result<libc::c_int> {
 fn owned(n: libc::c_int) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(n) }
 }
-struct SocketPath {
+pub struct SocketPath {
     path: PathBuf,
     inode: u64,
 }
@@ -530,6 +530,209 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         println!("MEDIA_PRODUCER_DONE frames={frames}");
     }
     println!("MEDIA_DONE frames={frames} encoded_bytes={position}");
+    Ok(())
+}
+
+/// Runtime stats for a socket feed hosted inside `petplay-media actor`.
+#[derive(Default)]
+pub struct FeedStats {
+    pub connected: std::sync::atomic::AtomicBool,
+    pub frames: std::sync::atomic::AtomicU64,
+}
+
+/// Configuration for a cancelable DMA-BUF socket feed hosted by `petplay-media actor`.
+pub struct SocketFeedConfig {
+    pub socket_path: PathBuf,
+    pub layout: publish::Layout,
+    pub framerate: u32,
+    pub bitrate: u32,
+    pub keyframe_seconds: u32,
+    pub persist: bool,
+    pub max_fps: Option<u32>,
+}
+
+fn poll_readable(fd: &OwnedFd, timeout_ms: i32) -> Result<bool> {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut p, 1, timeout_ms) };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(err).context("poll socket");
+    }
+    Ok(n > 0)
+}
+
+/// Bind `socket_path` (creating parent dirs and removing any stale socket file).
+pub fn bind_socket_feed(socket_path: &Path) -> Result<(OwnedFd, SocketPath)> {
+    if let Some(parent) = socket_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::remove_file(socket_path);
+    listen(socket_path)
+}
+
+/// Run a cancelable DMA-BUF socket feed for `petplay-media actor`. Never writes to stdout.
+pub fn run_socket_feed(
+    listener: OwnedFd,
+    _socket_guard: SocketPath,
+    cfg: SocketFeedConfig,
+    mut publisher: publish::Publisher,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stats: std::sync::Arc<FeedStats>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let mut encoder: Option<Encoder> = None;
+    let mut geometry = None;
+    let min_interval = cfg
+        .max_fps
+        .map(|fps| Duration::from_secs_f64(0.75 / f64::from(fps)));
+    let mut last_encoded: Option<Instant> = None;
+    let mut frames = 0u64;
+
+    while !stop.load(Ordering::Relaxed) {
+        if !poll_readable(&listener, 100)? {
+            continue;
+        }
+        let client = owned(syscall(
+            unsafe {
+                libc::accept4(
+                    listener.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            },
+            "accept producer",
+        )?);
+        stats.connected.store(true, Ordering::Relaxed);
+        let mut last = [0u64; 3];
+        let mut force_key = true;
+        while !stop.load(Ordering::Relaxed) {
+            if !poll_readable(&client, 100)? {
+                continue;
+            }
+            let (b, mut fds) = match receive(&client) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => break,
+                Err(error) if cfg.persist => {
+                    eprintln!("[petplayMedia] producer lost on {}: {error:#}", cfg.socket_path.display());
+                    break;
+                }
+                Err(error) => {
+                    stats.connected.store(false, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            let slot = u32at(&b, 8) as usize;
+            let seq = u64at(&b, 16);
+            let timestamp = u64at(&b, 24);
+            let width = u32at(&b, 32);
+            let height = u32at(&b, 36);
+            let pitch = u32at(&b, 40);
+            let offset = u32at(&b, 44);
+            let modifier = u64at(&b, 48);
+            let format = u32at(&b, 56);
+            ensure!(
+                slot < 3
+                    && seq > last[slot]
+                    && (16..=8192).contains(&width)
+                    && (16..=8192).contains(&height)
+                    && width % 2 == 0
+                    && height % 2 == 0
+                    && pitch >= width * 4
+                    && pitch <= 65536
+                    && offset <= 65536
+                    && modifier == 0
+                    && format == 44,
+                "unsupported frame descriptor or sequence"
+            );
+            if let Some(interval) = min_interval {
+                let now = Instant::now();
+                if last_encoded.is_some_and(|at| now.duration_since(at) < interval) {
+                    last[slot] = seq;
+                    if let Err(error) = release(&client, slot, seq) {
+                        if cfg.persist {
+                            eprintln!("[petplayMedia] slot release failed: {error}");
+                            break;
+                        }
+                        stats.connected.store(false, Ordering::Relaxed);
+                        bail!("slot release failed: {error}");
+                    }
+                    continue;
+                }
+                last_encoded = Some(now);
+            }
+            if u32at(&b, 12) == 0 {
+                let ready = fds.pop().unwrap();
+                wait_ready(&ready)?;
+            }
+            let image = fds.pop().unwrap();
+            if encoder.is_none() || geometry != Some((width, height)) {
+                let mut enc_cfg = Config::new(
+                    width,
+                    height,
+                    cfg.framerate,
+                    cfg.bitrate,
+                    cfg.framerate * cfg.keyframe_seconds,
+                );
+                enc_cfg.device = Some("/dev/dri/renderD128".into());
+                encoder = Some(Encoder::new(enc_cfg).context("hardware H.264 encoder")?);
+                geometry = Some((width, height));
+                publisher.describe(publish::Format {
+                    width,
+                    height,
+                    framerate: cfg.framerate,
+                    layout: cfg.layout,
+                });
+                force_key = true;
+                eprintln!(
+                    "[petplayMedia] source ready {}: {width}x{height} @ {} fps ({:?})",
+                    cfg.socket_path.display(),
+                    cfg.framerate,
+                    cfg.layout
+                );
+            }
+            let key = force_key || frames % u64::from(cfg.framerate * cfg.keyframe_seconds) == 0;
+            force_key = false;
+            let buffer = DmaBuf {
+                drm_format: drm::ARGB8888,
+                modifier,
+                width,
+                height,
+                planes: vec![Plane { offset, pitch }],
+                fd: image,
+                color: None,
+            };
+            let encoded = encoder
+                .as_mut()
+                .unwrap()
+                .encode_dmabuf(buffer, key)
+                .context("strict GPU DMA-BUF encode")?;
+            ensure!(!encoded.is_empty(), "empty encoded frame");
+            publisher.frame(&encoded, key, timestamp)?;
+            last[slot] = seq;
+            frames += 1;
+            stats.frames.store(frames, Ordering::Relaxed);
+            if let Err(error) = release(&client, slot, seq) {
+                if cfg.persist {
+                    eprintln!("[petplayMedia] slot release failed: {error}");
+                    break;
+                }
+                stats.connected.store(false, Ordering::Relaxed);
+                bail!("slot release failed: {error}");
+            }
+        }
+        stats.connected.store(false, Ordering::Relaxed);
+        if !cfg.persist {
+            break;
+        }
+    }
     Ok(())
 }
 

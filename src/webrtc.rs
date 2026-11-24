@@ -51,16 +51,22 @@ pub struct WebRtcHub {
 }
 
 impl WebRtcHub {
-    /// Start a loopback-only SDP signaling listener and return the hub to push frames into.
-    /// Announces `WEBRTC_READY http://127.0.0.1:<port>/offer` on stdout.
-    pub fn start(runtime: &tokio::runtime::Runtime, bind_ip: IpAddr) -> Result<(Self, SocketAddr)> {
+    /// Create a WebRTC hub without a loopback HTTP signaling server (for StageForge actor mode,
+    /// where SDP offers arrive directly via `WEBRTC_OFFER` messages).
+    pub fn new(bind_ip: IpAddr) -> Self {
         ensure_crypto();
         let (tx, _) = broadcast::channel(64);
-        let hub = Self {
+        Self {
             bind_ip,
             tx,
             latest_key: Arc::new(RwLock::new(None)),
-        };
+        }
+    }
+
+    /// Start a loopback-only SDP signaling listener and return the hub to push frames into.
+    /// Announces `WEBRTC_READY http://127.0.0.1:<port>/offer` on stdout.
+    pub fn start(runtime: &tokio::runtime::Runtime, bind_ip: IpAddr) -> Result<(Self, SocketAddr)> {
+        let hub = Self::new(bind_ip);
         let listener = runtime.block_on(TcpListener::bind(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             0,

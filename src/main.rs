@@ -1,4 +1,5 @@
 //! Native media worker. Only DMA-BUF descriptors and encoded bytes cross CPU memory.
+mod actor;
 #[cfg(feature = "publish")]
 mod annexb_source;
 #[cfg(all(feature = "encode", target_os = "linux"))]
@@ -142,6 +143,9 @@ fn main() -> Result<()> {
         return atlas::run(&args[2..]);
         #[cfg(not(all(feature = "encode", target_os = "linux")))]
         anyhow::bail!("atlas needs Linux and --features encode");
+    }
+    if args.get(1).is_some_and(|a| a == "actor") {
+        return actor::run();
     }
     if args.get(1).is_some_and(|a| a == "gateway") {
         return gateway::run(&args[2..]);

@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal",
 url = "2"
 data-encoding = "2"
 serde_json = "1"
+stageforge-actor = { path = "../stageforge/rust" }
 str0m = { version = "0.26", default-features = false, features = ["rust-crypto"] }
 gbm = { version = "0.18", default-features = false, optional = true }
 opus = { version = "0.4", optional = true }

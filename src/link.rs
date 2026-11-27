@@ -25,6 +25,8 @@
 //! Link → PetPlay (stdout):
 //! - `{"ev":"ready","id":…,"relay":…|null,"addrs":[…]}` once, when the discovery endpoint is ready
 //! - `{"ev":"direct_ready","req":N,"id":…,"relay":…|null,"addrs":[…]}`
+//! - `{"ev":"path","conn":N,"path":"direct"|"relay","remote":…,"rtt_ms":N,"open":[…]}` when a
+//!   connection's selected network path changes (and once it has one)
 //! - `{"ev":"connected","req":N,"conn":C,"peer":…,"tier":"discovery"|"direct"}` / `{"ev":"failed","req":N,"error":…}`
 //! - `{"ev":"incoming","conn":C,"peer":…,"tier":"discovery"|"direct"}`
 //! - `{"ev":"data","conn":C,"data":"…"}`
@@ -474,6 +476,7 @@ fn start_conn(
         .insert(conn, ConnEntry { tx, peer, tier });
     // Announced before the reader starts, so PetPlay knows the connection before its data.
     let _ = state.out.send(announce(conn));
+    watch_paths(state.out.clone(), connection.clone(), conn, tier);
 
     let writer_connection = connection.clone();
     tokio::spawn(async move {
@@ -549,6 +552,65 @@ fn start_conn(
             .send(json!({ "ev": "closed", "conn": conn, "reason": reason }));
     });
     conn
+}
+
+/// Reports which network path a connection uses: `direct` (UDP, holepunched or LAN) or `relay`,
+/// with its remote address and RTT, once at start and whenever the selected path changes. This
+/// is how logs show whether holepunching worked without a packet capture.
+fn watch_paths(
+    out: mpsc::UnboundedSender<Value>,
+    connection: Connection,
+    conn: u64,
+    tier: &'static str,
+) {
+    tokio::spawn(async move {
+        let mut last: Option<(bool, String)> = None;
+        let mut announced_rtt = 0u128;
+        loop {
+            if connection.close_reason().is_some() {
+                break;
+            }
+            let paths = connection.paths();
+            let open = paths.len();
+            let selected = paths.iter().find(|path| path.is_selected()).map(|path| {
+                (
+                    path.is_ip(),
+                    path.remote_addr().to_string(),
+                    path.rtt().as_millis(),
+                )
+            });
+            // `TransportAddr` prints as `ip:<addr>` or `relay:<url>`.
+            let candidates: Vec<String> = paths
+                .iter()
+                .map(|path| path.remote_addr().to_string())
+                .collect();
+            drop(paths);
+            if let Some((direct, remote, rtt)) = selected {
+                let key = (direct, remote.clone());
+                // Also re-announce when RTT moves a lot, so a degrading path shows in the log.
+                let rtt_moved = rtt.abs_diff(announced_rtt) > 50
+                    && rtt.abs_diff(announced_rtt) * 2 > announced_rtt;
+                if last.as_ref() != Some(&key) || rtt_moved {
+                    let kind = if direct { "direct" } else { "relay" };
+                    eprintln!(
+                        "[link] conn {conn} ({tier}) path: {kind} via {remote}, rtt {rtt} ms, {open} open: {}",
+                        candidates.join(" ")
+                    );
+                    let _ = out.send(json!({
+                        "ev": "path",
+                        "conn": conn,
+                        "path": kind,
+                        "remote": remote,
+                        "rtt_ms": rtt as u64,
+                        "open": candidates,
+                    }));
+                    last = Some(key);
+                    announced_rtt = rtt;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
 }
 
 fn closed_reason(connection: &Connection, error: std::io::Error) -> String {

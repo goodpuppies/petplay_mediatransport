@@ -103,8 +103,10 @@ where
         let session = client.connect(url);
         let stream = async {
             if let (Some(addr), Some(endpoint)) = (&shared, &endpoint) {
-                crate::peer::require_direct(endpoint, addr.id, Duration::from_secs(15)).await?;
-                println!("RECEIVER_DIRECT");
+                match crate::peer::prefer_direct(endpoint, addr.id, crate::peer::DIRECT_GRACE).await {
+                    crate::peer::MediaPath::Direct => println!("RECEIVER_DIRECT"),
+                    crate::peer::MediaPath::Relayed => println!("RECEIVER_RELAYED"),
+                }
             }
             let deadline = Instant::now() + Duration::from_secs(15);
             let broadcast = loop {
@@ -119,15 +121,7 @@ where
             consume(broadcast).await
         };
         tokio::pin!(stream);
-        if let (Some(addr), Some(endpoint)) = (shared.clone(), endpoint.clone()) {
-            let policy = async {
-                crate::peer::require_direct(&endpoint, addr.id, Duration::from_secs(15)).await?;
-                crate::peer::watch_direct(&endpoint, addr.id).await
-            };
-            tokio::select! {r=&mut stream=>r,r=session.closed()=>{r?;Ok(())},r=policy=>r}
-        } else {
-            tokio::select! {r=&mut stream=>r,r=session.closed()=>{r?;Ok(())}}
-        }
+        tokio::select! {r=&mut stream=>r,r=session.closed()=>{r?;Ok(())}}
     }))
 }
 

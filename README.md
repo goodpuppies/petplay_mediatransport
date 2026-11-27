@@ -81,7 +81,7 @@ target/release/petplay-media "$PWD/_scratch/media.sock" - 127.0.0.1:4450 --iroh-
   --layout mono --fps 60
 # IROH_SHARE code=...
 target/release/petplay-media gateway CODE 127.0.0.1:4470
-# GATEWAY_DIRECT peer=...
+# GATEWAY_DIRECT peer=...   (or GATEWAY_RELAYED when holepunching fails)
 ```
 
 **A share code is a secret.** It carries the endpoint id, relay URL and direct addresses,
@@ -89,16 +89,17 @@ and nothing is published to a discovery service — so holding the code is the o
 find the source, and also all that is needed to watch it. Restricting a source to specific
 viewer identities is not implemented. The code also contains the source's IP addresses.
 
-The gateway waits for a direct path before starting its browser listener, failing after
-15 seconds if it cannot establish one. MoQ track requests are lazy, so no browser can request
-video/config frames during relay-assisted setup. `GATEWAY_DIRECT` is printed before
-`VIEWER_READY` and `GATEWAY_READY`.
+The gateway gives holepunching up to 5 seconds to find a direct path before starting its
+browser listener (MoQ track requests are lazy, so no browser can request video/config frames
+before then). It prints `GATEWAY_DIRECT` when it found one and `GATEWAY_RELAYED` when it did
+not, before `VIEWER_READY` and `GATEWAY_READY`; the receiver prints `RECEIVER_DIRECT` or
+`RECEIVER_RELAYED` the same way.
 
-After startup the gateway observes the direct route every 100 ms and stops when iroh reports
-it lost. This is a fail-on-observed-loss policy, not a packet-level relay prohibition: iroh's
-path detection and a subsequent poll can lag a path transition. Brief fallback traffic during
-that detection window is still possible. Relays may carry encrypted connection setup and MoQ
-announcements before media is enabled.
+When no direct path exists (symmetric NAT, strict firewalls) the stream runs over the relay
+instead of failing, and iroh still moves it to a direct path if holepunching succeeds later.
+Relayed media stays end-to-end encrypted QUIC: the relay sees ciphertext and the two endpoint
+ids. n0's public relays are rate-limited, so a relayed stream may need a lower bitrate or a
+self-hosted `--relay`.
 
 Each WebTransport listener also serves viewer HTML, JavaScript, and `config.json` over TCP on
 the same IP at its port plus one. For this example the gateway viewer is

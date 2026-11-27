@@ -55,31 +55,28 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
             .with_iroh_addrs(direct)
             .with_subscriber(origin);
         let session = client.connect(url);
-        // Do not expose a consuming origin to browsers until holepunching succeeds.
-        // MoQ requests tracks lazily: before this gate there are no downstream
-        // consumers and therefore no video/config subscriptions on the iroh session.
+        // Give holepunching a short head start before exposing the consuming origin to
+        // browsers; MoQ requests tracks lazily, so nothing flows before this. If no direct
+        // path appears, the stream continues over the relay.
         if let Some(addr) = &shared {
-            tokio::select! {
-                result = crate::peer::require_direct(&endpoint, addr.id, std::time::Duration::from_secs(15)) => result?,
+            let path = tokio::select! {
+                path = crate::peer::prefer_direct(&endpoint, addr.id, crate::peer::DIRECT_GRACE) => path,
                 result = session.closed() => {
                     result?;
-                    anyhow::bail!("source closed before a direct media path was established");
+                    anyhow::bail!("source closed before the media path was established");
                 }
+            };
+            match path {
+                crate::peer::MediaPath::Direct => println!("GATEWAY_DIRECT peer={}", addr.id),
+                crate::peer::MediaPath::Relayed => println!("GATEWAY_RELAYED peer={}", addr.id),
             }
-            println!("GATEWAY_DIRECT peer={}", addr.id);
         }
         let (fingerprint, _) = crate::publish::serve(
             &runtime, browser_origin, bind, crate::publish::Transport::Browser,
         )?;
         crate::web::start(bind, &fingerprint)?;
         println!("GATEWAY_READY transport=iroh browser_fingerprint={fingerprint}");
-        match shared {
-            Some(addr) => tokio::select! {
-                result = crate::peer::watch_direct(&endpoint, addr.id) => result?,
-                result = session.closed() => result?,
-            },
-            None => session.closed().await?,
-        }
+        session.closed().await?;
         Ok(())
     })
 }

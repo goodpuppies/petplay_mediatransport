@@ -6,10 +6,10 @@
 //! needed to watch it. **Treat a share code as a secret.** Restricting a source to
 //! specific viewer identities is not implemented.
 //!
-//! Relays carry connection setup and holepunch coordination. The media path itself is
-//! required to become direct: see [`require_direct`]. A relayed path is refused rather
-//! than used, so a connection that cannot be holepunched fails instead of sending the
-//! stream through a third party's server.
+//! Relays carry connection setup and holepunch coordination, and the media path prefers to
+//! become direct: see [`prefer_direct`]. When holepunching fails (symmetric NAT, strict
+//! firewalls) the stream falls back to the relay instead of failing. Relayed traffic stays
+//! end-to-end encrypted QUIC; the relay sees only ciphertext and the two endpoint ids.
 
 use anyhow::{Context, Result, bail, ensure};
 use data_encoding::BASE32_NOPAD;
@@ -180,21 +180,29 @@ pub fn direct_addresses(addr: &EndpointAddr) -> Vec<SocketAddr> {
         .collect()
 }
 
-/// Fail unless the path to `peer` became a direct one.
+/// Which route the media path to a peer took once [`prefer_direct`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaPath {
+    Direct,
+    Relayed,
+}
+
+/// Give holepunching up to `within` to make the path to `peer` direct, then carry on.
 ///
-/// The gateway must not expose its consuming origin before this returns. Connection
-/// setup and announcements can use a relay, but track requests are deferred.
-pub async fn require_direct(endpoint: &Endpoint, peer: EndpointId, within: Duration) -> Result<()> {
+/// Returns [`MediaPath::Relayed`] when no direct path appeared in time: the connection keeps
+/// using the relay, and iroh still upgrades it to direct later if holepunching succeeds.
+pub async fn prefer_direct(endpoint: &Endpoint, peer: EndpointId, within: Duration) -> MediaPath {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         if is_direct(endpoint, peer).await {
-            return Ok(());
+            return MediaPath::Direct;
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "no direct peer-to-peer path to {peer} within {within:?}. \
-                 Relayed media is refused, so the stream stops here."
+            eprintln!(
+                "no direct peer-to-peer path to {peer} within {within:?}; \
+                 continuing over the relay"
             );
+            return MediaPath::Relayed;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -209,16 +217,8 @@ async fn is_direct(endpoint: &Endpoint, peer: EndpointId) -> bool {
     })
 }
 
-/// Stop an established gateway when the direct route disappears instead of allowing
-/// an indefinite relay fallback. Observation is periodic, not a packet-level relay ban.
-pub async fn watch_direct(endpoint: &Endpoint, peer: EndpointId) -> Result<()> {
-    loop {
-        if !is_direct(endpoint, peer).await {
-            bail!("direct peer-to-peer path to {peer} was lost; refusing relay fallback");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
+/// How long [`prefer_direct`] waits for holepunching before settling for the relay.
+pub const DIRECT_GRACE: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
@@ -248,9 +248,9 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_with_no_direct_path_is_refused_rather_than_relayed() {
+    fn a_peer_with_no_direct_path_falls_back_to_the_relay() {
         // A loopback-only endpoint reaches no relay and no peer, which is what a failed
-        // holepunch looks like to `require_direct`.
+        // holepunch looks like to `prefer_direct`.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -265,17 +265,9 @@ mod tests {
                 .await
                 .unwrap();
             let absent = moq_tokio::iroh::web_transport_iroh::iroh::SecretKey::generate().public();
-            let error = require_direct(&endpoint, absent, Duration::from_millis(300))
-                .await
-                .expect_err("a peer with no path must be refused");
-            assert!(error.to_string().contains("no direct peer-to-peer path"));
-            let error = watch_direct(&endpoint, absent)
-                .await
-                .expect_err("an established gateway must stop when no direct path remains");
-            assert!(
-                error
-                    .to_string()
-                    .contains("was lost; refusing relay fallback")
+            assert_eq!(
+                prefer_direct(&endpoint, absent, Duration::from_millis(300)).await,
+                MediaPath::Relayed
             );
             endpoint.close().await;
         });

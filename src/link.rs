@@ -5,22 +5,30 @@
 //! Each connection is one iroh connection with ALPN [`ALPN`] and one bidirectional stream of
 //! length-prefixed UTF-8 frames (actor messages, already JSON text). The dialer writes first.
 //!
+//! Two endpoints separate untrusted discovery from trusted direct P2P (mitigating iroh#3535):
+//! - **Discovery endpoint** (published on the topic server): when not `--local`, built with
+//!   `clear_ip_transports()` so it is strictly relay-only and never binds UDP or leaks direct IP
+//!   addresses to untrusted peers.
+//! - **Direct endpoint** (never published on the topic server): created lazily on demand with full
+//!   IP + relay NAT traversal and an `EndpointHooks::after_handshake` allowlist of trusted peer
+//!   endpoint ids. Peers only learn this endpoint id over the encrypted discovery link after the
+//!   user trusts them.
+//!
 //! PetPlay → link (stdin):
-//! - `{"op":"connect","req":N,"endpoint":{"id":…,"relay":…?,"addrs":[…]?}}`
+//! - `{"op":"connect","req":N,"endpoint":{"id":…,"relay":…?,"addrs":[…]?},"tier":"discovery"|"direct"?}`
+//! - `{"op":"direct_endpoint","req":N}`
+//! - `{"op":"allow_direct","peer":"<EndpointId>"}`
+//! - `{"op":"revoke_direct","peer":"<EndpointId>"}`
 //! - `{"op":"send","conn":C,"data":"…"}`
 //! - `{"op":"close","conn":C,"reason":"…"}`
 //!
 //! Link → PetPlay (stdout):
-//! - `{"ev":"ready","id":…,"relay":…|null,"addrs":[…]}` once, when the endpoint can be reached
-//! - `{"ev":"connected","req":N,"conn":C}` / `{"ev":"failed","req":N,"error":…}`
-//! - `{"ev":"incoming","conn":C,"peer":…}`
+//! - `{"ev":"ready","id":…,"relay":…|null,"addrs":[…]}` once, when the discovery endpoint is ready
+//! - `{"ev":"direct_ready","req":N,"id":…,"relay":…|null,"addrs":[…]}`
+//! - `{"ev":"connected","req":N,"conn":C,"peer":…,"tier":"discovery"|"direct"}` / `{"ev":"failed","req":N,"error":…}`
+//! - `{"ev":"incoming","conn":C,"peer":…,"tier":"discovery"|"direct"}`
 //! - `{"ev":"data","conn":C,"data":"…"}`
 //! - `{"ev":"closed","conn":C,"reason":…}`
-//!
-//! The endpoint id plus relay URL is what a process publishes in a topic record: it identifies and
-//! authenticates the peer and reveals no IP address. iroh holepunches to a direct path through
-//! the relay when it can; until then (and always, for browsers) frames go through the relay,
-//! end-to-end encrypted. Actors negotiate better transports between themselves afterwards.
 //!
 //! `--relay URL` uses that relay (a self-hosted `iroh-relay`, or `iroh-relay --dev` for tests)
 //! instead of n0's public ones. `--local` binds loopback only with no relay, for tests on one
@@ -33,11 +41,11 @@ use anyhow::{Context, Result, bail};
 use moq_tokio::iroh::web_transport_iroh::iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher,
     address_lookup::MemoryLookup,
-    endpoint::{Connection, RelayMode, default_relay_mode, presets},
+    endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, RelayMode, default_relay_mode, presets},
 };
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -63,12 +71,46 @@ enum ConnCommand {
     Close(String),
 }
 
-struct State {
+struct ConnEntry {
+    tx: mpsc::UnboundedSender<ConnCommand>,
+    peer: EndpointId,
+    tier: &'static str,
+}
+
+#[derive(Debug)]
+struct DirectAllowlistHook {
+    allowed: Arc<Mutex<HashSet<EndpointId>>>,
+}
+
+impl EndpointHooks for DirectAllowlistHook {
+    async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
+        if self.allowed.lock().unwrap().contains(&conn.remote_id()) {
+            AfterHandshakeOutcome::accept()
+        } else {
+            AfterHandshakeOutcome::Reject {
+                error_code: 403u32.into(),
+                reason: b"untrusted peer".to_vec(),
+            }
+        }
+    }
+}
+
+struct DirectNode {
     endpoint: Endpoint,
     lookup: MemoryLookup,
+    acceptor: tokio::task::JoinHandle<()>,
+}
+
+struct State {
+    local: bool,
+    relay: Option<RelayUrl>,
+    endpoint: Endpoint,
+    lookup: MemoryLookup,
+    direct: tokio::sync::Mutex<Option<Arc<DirectNode>>>,
+    allowed_direct: Arc<Mutex<HashSet<EndpointId>>>,
     out: Out,
     next_conn: AtomicU64,
-    conns: Mutex<HashMap<u64, mpsc::UnboundedSender<ConnCommand>>>,
+    conns: Mutex<HashMap<u64, ConnEntry>>,
 }
 
 pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
@@ -98,19 +140,22 @@ async fn serve(local: bool, relay: Option<RelayUrl>) -> Result<()> {
             .clear_address_lookup()
             .bind_addr("127.0.0.1:0".parse::<SocketAddr>()?)?
     } else {
-        // `Minimal` publishes nothing about this endpoint; peers reach it by the id and relay
-        // URL a process hands them. The relay coordinates holepunching.
-        Endpoint::builder(presets::Minimal).relay_mode(match relay {
-            Some(url) => RelayMode::custom([url]),
-            None => default_relay_mode(),
-        })
+        // Discovery endpoint is strictly relay-only (`clear_ip_transports`): it binds no UDP
+        // socket and has zero direct IP candidates, preventing iroh#3535 IP leaks to untrusted
+        // peers on the topic server. Trusted peers upgrade to the lazy direct endpoint.
+        Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .relay_mode(match relay.clone() {
+                Some(url) => RelayMode::custom([url]),
+                None => default_relay_mode(),
+            })
     };
     let endpoint = builder
         .address_lookup(lookup.clone())
         .alpns(vec![ALPN.to_vec()])
         .bind()
         .await
-        .context("binding the link endpoint")?;
+        .context("binding the link discovery endpoint")?;
     if !local {
         tokio::time::timeout(Duration::from_secs(15), endpoint.online())
             .await
@@ -131,15 +176,19 @@ async fn serve(local: bool, relay: Option<RelayUrl>) -> Result<()> {
     });
 
     let state = Arc::new(State {
+        local,
+        relay,
         endpoint: endpoint.clone(),
         lookup,
+        direct: tokio::sync::Mutex::new(None),
+        allowed_direct: Arc::new(Mutex::new(HashSet::new())),
         out: out.clone(),
         next_conn: AtomicU64::new(1),
         conns: Mutex::new(HashMap::new()),
     });
-    out.send(ready_event(&endpoint))?;
+    out.send(endpoint_event("ready", None, &endpoint))?;
 
-    let acceptor = tokio::spawn(accept_loop(state.clone()));
+    let acceptor = tokio::spawn(accept_loop(state.clone(), endpoint.clone(), "discovery"));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     // PetPlay owns this process: stdin closing means it is gone.
     while let Some(line) = lines.next_line().await? {
@@ -152,6 +201,10 @@ async fn serve(local: bool, relay: Option<RelayUrl>) -> Result<()> {
         }
     }
     acceptor.abort();
+    if let Some(direct) = state.direct.lock().await.take() {
+        direct.acceptor.abort();
+        direct.endpoint.close().await;
+    }
     endpoint.close().await;
     drop(state);
     drop(out);
@@ -159,7 +212,7 @@ async fn serve(local: bool, relay: Option<RelayUrl>) -> Result<()> {
     Ok(())
 }
 
-fn ready_event(endpoint: &Endpoint) -> Value {
+fn endpoint_event(ev: &str, req: Option<Value>, endpoint: &Endpoint) -> Value {
     let addr = endpoint.watch_addr().get();
     let relay = addr.addrs.iter().find_map(|entry| match entry {
         TransportAddr::Relay(url) => Some(url.to_string()),
@@ -173,27 +226,145 @@ fn ready_event(endpoint: &Endpoint) -> Value {
             _ => None,
         })
         .collect();
-    json!({ "ev": "ready", "id": endpoint.id().to_string(), "relay": relay, "addrs": addrs })
+    match req {
+        Some(req) => json!({
+            "ev": ev,
+            "req": req,
+            "id": endpoint.id().to_string(),
+            "relay": relay,
+            "addrs": addrs,
+        }),
+        None => json!({
+            "ev": ev,
+            "id": endpoint.id().to_string(),
+            "relay": relay,
+            "addrs": addrs,
+        }),
+    }
+}
+
+async fn ensure_direct(state: &Arc<State>) -> Result<Arc<DirectNode>> {
+    let mut guard = state.direct.lock().await;
+    if let Some(existing) = guard.as_ref() {
+        return Ok(existing.clone());
+    }
+    let lookup = MemoryLookup::new();
+    let hook = DirectAllowlistHook {
+        allowed: state.allowed_direct.clone(),
+    };
+    let builder = if state.local {
+        Endpoint::builder(presets::Minimal)
+            .clear_relay_transports()
+            .clear_address_lookup()
+            .bind_addr("127.0.0.1:0".parse::<SocketAddr>()?)?
+    } else {
+        // Direct P2P endpoint: keeps IP transports enabled for holepunching, guarded by
+        // `DirectAllowlistHook` and never published to the topic server.
+        Endpoint::builder(presets::Minimal).relay_mode(match state.relay.clone() {
+            Some(url) => RelayMode::custom([url]),
+            None => default_relay_mode(),
+        })
+    };
+    let endpoint = builder
+        .address_lookup(lookup.clone())
+        .alpns(vec![ALPN.to_vec()])
+        .hooks(hook)
+        .bind()
+        .await
+        .context("binding the link direct endpoint")?;
+    if !state.local {
+        tokio::time::timeout(Duration::from_secs(15), endpoint.online())
+            .await
+            .context("no relay connection for direct endpoint")?;
+    }
+    let acceptor = tokio::spawn(accept_loop(state.clone(), endpoint.clone(), "direct"));
+    let node = Arc::new(DirectNode {
+        endpoint,
+        lookup,
+        acceptor,
+    });
+    *guard = Some(node.clone());
+    Ok(node)
 }
 
 fn handle(state: &Arc<State>, command: Value) {
     match command["op"].as_str() {
         Some("connect") => {
             let req = command["req"].clone();
+            let tier = match command["tier"].as_str() {
+                Some("direct") => "direct",
+                _ => "discovery",
+            };
             let state = state.clone();
             tokio::spawn(async move {
-                if let Err(error) = connect(&state, &command["endpoint"], req.clone()).await {
+                if let Err(error) = connect(&state, &command["endpoint"], req.clone(), tier).await {
                     let _ = state
                         .out
                         .send(json!({ "ev": "failed", "req": req, "error": format!("{error:#}") }));
                 }
             });
         }
+        Some("direct_endpoint") => {
+            let req = command["req"].clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                match ensure_direct(&state).await {
+                    Ok(direct) => {
+                        let _ = state
+                            .out
+                            .send(endpoint_event("direct_ready", Some(req), &direct.endpoint));
+                    }
+                    Err(error) => {
+                        let _ = state.out.send(json!({
+                            "ev": "failed",
+                            "req": req,
+                            "error": format!("{error:#}"),
+                        }));
+                    }
+                }
+            });
+        }
+        Some("allow_direct") => {
+            if let Some(peer) = command["peer"].as_str() {
+                match peer.parse::<EndpointId>() {
+                    Ok(id) => {
+                        state.allowed_direct.lock().unwrap().insert(id);
+                    }
+                    Err(error) => eprintln!("[link] bad allow_direct peer {peer:?}: {error}"),
+                }
+            }
+        }
+        Some("revoke_direct") => {
+            if let Some(peer) = command["peer"].as_str() {
+                match peer.parse::<EndpointId>() {
+                    Ok(id) => {
+                        state.allowed_direct.lock().unwrap().remove(&id);
+                        let to_close: Vec<_> = state
+                            .conns
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .filter(|entry| entry.tier == "direct" && entry.peer == id)
+                            .map(|entry| entry.tx.clone())
+                            .collect();
+                        for tx in to_close {
+                            let _ = tx.send(ConnCommand::Close("peer untrusted".to_owned()));
+                        }
+                    }
+                    Err(error) => eprintln!("[link] bad revoke_direct peer {peer:?}: {error}"),
+                }
+            }
+        }
         Some(op @ ("send" | "close")) => {
             let Some(conn) = command["conn"].as_u64() else {
                 return;
             };
-            let sender = state.conns.lock().unwrap().get(&conn).cloned();
+            let sender = state
+                .conns
+                .lock()
+                .unwrap()
+                .get(&conn)
+                .map(|entry| entry.tx.clone());
             let Some(sender) = sender else { return };
             let _ = sender.send(if op == "send" {
                 ConnCommand::Send(command["data"].as_str().unwrap_or_default().to_owned())
@@ -227,25 +398,37 @@ fn parse_endpoint(value: &Value) -> Result<EndpointAddr> {
     Ok(addr)
 }
 
-async fn connect(state: &Arc<State>, endpoint: &Value, req: Value) -> Result<u64> {
+async fn connect(state: &Arc<State>, endpoint: &Value, req: Value, tier: &'static str) -> Result<u64> {
     let addr = parse_endpoint(endpoint)?;
-    state.lookup.add_endpoint_info(addr.clone());
-    let connection =
+    let peer_id = addr.id;
+    let connection = if tier == "direct" {
+        state.allowed_direct.lock().unwrap().insert(peer_id);
+        let direct = ensure_direct(state).await?;
+        direct.lookup.add_endpoint_info(addr.clone());
+        tokio::time::timeout(Duration::from_secs(20), direct.endpoint.connect(addr, ALPN))
+            .await
+            .context("timed out connecting (direct)")??
+    } else {
+        state.lookup.add_endpoint_info(addr.clone());
         tokio::time::timeout(Duration::from_secs(20), state.endpoint.connect(addr, ALPN))
             .await
-            .context("timed out connecting")??;
+            .context("timed out connecting")??
+    };
     let (send, recv) = connection.open_bi().await?;
+    let peer = peer_id.to_string();
     Ok(start_conn(
         state,
         connection,
+        peer_id,
+        tier,
         send,
         recv,
-        |conn| json!({ "ev": "connected", "req": req, "conn": conn }),
+        |conn| json!({ "ev": "connected", "req": req, "conn": conn, "peer": peer, "tier": tier }),
     ))
 }
 
-async fn accept_loop(state: Arc<State>) {
-    while let Some(incoming) = state.endpoint.accept().await {
+async fn accept_loop(state: Arc<State>, endpoint: Endpoint, tier: &'static str) {
+    while let Some(incoming) = endpoint.accept().await {
         let state = state.clone();
         tokio::spawn(async move {
             let accepted = async {
@@ -255,16 +438,19 @@ async fn accept_loop(state: Arc<State>) {
             };
             match accepted.await {
                 Ok((connection, send, recv)) => {
-                    let peer = connection.remote_id().to_string();
+                    let peer_id = connection.remote_id();
+                    let peer = peer_id.to_string();
                     start_conn(
                         &state,
                         connection,
+                        peer_id,
+                        tier,
                         send,
                         recv,
-                        |conn| json!({ "ev": "incoming", "conn": conn, "peer": peer }),
+                        |conn| json!({ "ev": "incoming", "conn": conn, "peer": peer, "tier": tier }),
                     );
                 }
-                Err(error) => eprintln!("[link] incoming connection failed: {error:#}"),
+                Err(error) => eprintln!("[link] incoming ({tier}) connection failed: {error:#}"),
             }
         });
     }
@@ -273,13 +459,19 @@ async fn accept_loop(state: Arc<State>) {
 fn start_conn(
     state: &Arc<State>,
     connection: Connection,
+    peer: EndpointId,
+    tier: &'static str,
     mut send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     mut recv: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     announce: impl FnOnce(u64) -> Value,
 ) -> u64 {
     let conn = state.next_conn.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<ConnCommand>();
-    state.conns.lock().unwrap().insert(conn, tx);
+    state
+        .conns
+        .lock()
+        .unwrap()
+        .insert(conn, ConnEntry { tx, peer, tier });
     // Announced before the reader starts, so PetPlay knows the connection before its data.
     let _ = state.out.send(announce(conn));
 
